@@ -1712,27 +1712,34 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
         let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
+        // Fast path: non-wrapping slice starting right at `cursor` (common case
+        // for n == 1 root views and sequential fresh tables).
+        let found = if enough && cursor + n <= end && !taken[cursor..cursor + n].iter().any(|&t| t) {
+            Some(cursor)
+        } else {
+            // Search from `next` on, then from the start (extending past cursor by
+            // n - 1 so contiguous runs crossing the cursor are not missed).
+            let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+            let starts = (cursor..end).chain(0..second_end);
+            let mut run = 0;
+            let mut found = None;
+            let mut last = usize::MAX;
+            for at in starts.take(if enough { usize::MAX } else { 0 }) {
+                // A run cannot wrap past the end.
+                if at != last.wrapping_add(1) {
+                    run = 0;
+                }
+                last = at;
+                run = if taken[at] { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at + 1 - n);
+                    break;
+                }
             }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+            found
+        };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -2595,16 +2602,29 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
+        self.release_many(&[(first, n)]);
+    }
+
+    /// Gives back multiple dynamic ranges under a single allocator lock.
+    pub(crate) fn release_many(&self, ranges: &[(u32, u32)]) {
+        if ranges.is_empty() {
             return;
-        };
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+        let mut total_given = 0u32;
+        for &(first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = at.saturating_add(n).min(self.dynamic) as usize;
+            if let Some(slots) = guard.1.get_mut(at as usize..end) {
+                total_given += slots.iter().filter(|taken| **taken).count() as u32;
+                slots.fill(false);
+            }
+        }
+        if total_given > 0 {
+            self.free.fetch_add(total_given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 

@@ -433,6 +433,122 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
 }
 
+/// Precomputed per-slot table metadata built once at pipeline creation so
+/// `State::tables` avoids rescanning/sorting `UsedResource` and `half_views`
+/// on every draw.
+pub(crate) struct SlotPlan {
+    pub(crate) slot: u8,
+    /// Indices into `Translated::used` for `RootType::Table` entries on `slot`
+    /// in original order (including duplicates).
+    pub(crate) used_indices: Box<[usize]>,
+    /// Sorted `(descriptor_index, first_used_index)` for O(log M) lookup in
+    /// fresh-table materialization.
+    pub(crate) first_at: Box<[(u32, usize)]>,
+    /// Sorted unique dword offsets in `half_views` for `slot`.
+    pub(crate) half_dwords: Box<[u32]>,
+    /// Sorted unique descriptor indices (`at / 8`) from `half_views` for `slot`.
+    pub(crate) half_indices: Box<[u32]>,
+    /// `RootIndexedView` entries targeting `slot`.
+    pub(crate) indexed: Box<[victory_shader::resource::RootIndexedView]>,
+    /// Maximum descriptor index among static `used_indices` and `half_indices`.
+    pub(crate) static_max: u32,
+    pub(crate) has_cbv: bool,
+    pub(crate) has_uav: bool,
+}
+
+/// Precomputed per-stage descriptor-table binding plan.
+pub(crate) struct StageTablePlan {
+    /// Distinct table slots in ascending `slot` order.
+    pub(crate) slots: Box<[SlotPlan]>,
+    /// `(slot_plan_index, used_index)` in original `used` order for non-fresh
+    /// direct-table entries.
+    pub(crate) direct_order: Box<[(usize, usize)]>,
+}
+
+impl StageTablePlan {
+    pub(crate) fn new(
+        used: &[victory_shader::UsedResource],
+        indexed: &[victory_shader::resource::RootIndexedView],
+        half: &[(u8, u32)],
+    ) -> Self {
+        use victory_shader::{ResourceType, RootType};
+        let mut slot_nums: Vec<u8> = Vec::new();
+        for u in used {
+            if u.root == RootType::Table && !slot_nums.contains(&u.slot) {
+                slot_nums.push(u.slot);
+            }
+        }
+        for &(s, _) in half {
+            if !slot_nums.contains(&s) {
+                slot_nums.push(s);
+            }
+        }
+        slot_nums.sort_unstable();
+
+        let mut slots = Vec::with_capacity(slot_nums.len());
+        for &slot in &slot_nums {
+            let mut used_indices = Vec::new();
+            let mut first_at: Vec<(u32, usize)> = Vec::new();
+            let mut has_cbv = false;
+            let mut has_uav = false;
+            let mut static_max = 0u32;
+            for (i, u) in used.iter().enumerate() {
+                if u.root == RootType::Table && u.slot == slot {
+                    used_indices.push(i);
+                    let k = u.table_offset_dwords / 8;
+                    static_max = static_max.max(k);
+                    if !first_at.iter().any(|&(ek, _)| ek == k) {
+                        first_at.push((k, i));
+                    }
+                    if u.kind == ResourceType::Cbv {
+                        has_cbv = true;
+                    } else if u.kind == ResourceType::Uav {
+                        has_uav = true;
+                    }
+                }
+            }
+            first_at.sort_unstable_by_key(|&(k, _)| k);
+
+            let mut half_dwords: Vec<u32> = half.iter().filter(|&&(s, _)| s == slot).map(|&(_, at)| at).collect();
+            half_dwords.sort_unstable();
+            half_dwords.dedup();
+            let mut half_indices: Vec<u32> = half_dwords.iter().map(|&at| at / 8).collect();
+            half_indices.sort_unstable();
+            half_indices.dedup();
+            if let Some(&last_half) = half_indices.last() {
+                static_max = static_max.max(last_half);
+            }
+
+            let slot_indexed: Vec<_> = indexed.iter().filter(|idx| idx.table_slot == slot).cloned().collect();
+            slots.push(SlotPlan {
+                slot,
+                used_indices: used_indices.into_boxed_slice(),
+                first_at: first_at.into_boxed_slice(),
+                half_dwords: half_dwords.into_boxed_slice(),
+                half_indices: half_indices.into_boxed_slice(),
+                indexed: slot_indexed.into_boxed_slice(),
+                static_max,
+                has_cbv,
+                has_uav,
+            });
+        }
+
+        let mut direct_order = Vec::new();
+        for (i, u) in used.iter().enumerate() {
+            if u.root == RootType::Table
+                && let Ok(sp_idx) = slot_nums.binary_search(&u.slot)
+            {
+                direct_order.push((sp_idx, i));
+            }
+        }
+
+        StageTablePlan {
+            slots: slots.into_boxed_slice(),
+            direct_order: direct_order.into_boxed_slice(),
+        }
+    }
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -444,6 +560,12 @@ pub(crate) struct Stage {
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
     /// `VICTORY_ROOT_SRV_DIRECT=1`).
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Precomputed descriptor-table binding plan for `State::tables`.
+    pub(crate) tables: StageTablePlan,
+    /// Whether this stage reads/writes title memory by raw address (`SLOT_MEMORY`).
+    pub(crate) uses_memory: bool,
+    /// Bitmask of root slots (< 64) that carry `USER_VIEW_BIAS`.
+    pub(crate) biased_srvs: u64,
 }
 
 impl Stage {
@@ -463,6 +585,9 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    /// Whether any stage binds root SRVs or root UAVs (needs a lent view heap
+    /// if the title did not bind one).
+    pub(crate) needs_lent_heap: bool,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -553,13 +678,25 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let translated = shader.translated()?;
+            let t = &translated.host;
+            let biased_srvs = t
+                .user_data
+                .iter()
+                .filter(|u| {
+                    u.root == victory_shader::native::RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
+                        && u.slot < 64
+                })
+                .fold(0u64, |mask, u| mask | (1u64 << u.slot));
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                tables: StageTablePlan::new(&translated.used, &t.root_indexed_views, &t.half_views),
+                uses_memory: t.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY),
+                biased_srvs,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -710,12 +847,14 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let needs_lent_heap = bound.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty());
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
                 root,
                 stages: bound,
+                needs_lent_heap,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -763,12 +902,14 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let needs_lent_heap = bound.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty());
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
                 root,
                 stages: bound,
+                needs_lent_heap,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -879,12 +1020,14 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
+        let needs_lent_heap = bound.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty());
         Some(HostPipeline {
             compute: false,
             mesh: false,
             pso,
             root,
             stages: bound,
+            needs_lent_heap,
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),

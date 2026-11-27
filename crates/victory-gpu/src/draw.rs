@@ -10,7 +10,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -360,9 +359,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        crate::descriptor::release_dynamic_many(&self.dynamic);
     }
 }
 
@@ -382,9 +379,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        crate::descriptor::release_dynamic_many(&self.dynamic);
+        self.dynamic.clear();
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -1158,7 +1154,7 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut views = Vec::with_capacity(handles.len());
+        let mut views: Few<(Option<&ID3D12Resource>, Option<D3D12_RENDER_TARGET_VIEW_DESC>), 8> = Few::default();
         let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -1221,7 +1217,10 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let mut rtvs: Few<D3D12_CPU_DESCRIPTOR_HANDLE, 8> = Few::default();
+        for (texture, desc) in views.iter() {
+            rtvs.push(host.rtv(*texture, desc.as_ref()));
+        }
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -1588,7 +1587,7 @@ impl State {
         // A list without a view heap: one of the title's for the views the
         // host itself puts into heap slots.
         if self.heaps[0] == 0
-            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty())
+            && p.needs_lent_heap
             && let Some(heap) = crate::descriptor::lent_heap()
         {
             once!("a dispatch without a view heap that needs one gets the title's");
@@ -1597,16 +1596,19 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut count = 0usize;
+            for &h in &self.heaps {
+                if h != 0
+                    && let Some(host_heap) = crate::descriptor::heap(h as This).host()
+                {
+                    list.keep(&host_heap.heap);
+                    heaps[count] = Some(host_heap.heap.clone());
+                    count += 1;
+                }
+            }
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            unsafe { l.SetDescriptorHeaps(&heaps[..count]) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
@@ -1645,13 +1647,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(
-                list,
-                &t.used,
-                &t.host.root_indexed_views,
-                &t.host.half_views,
-                compute,
-            );
+            let made = self.tables(list, &t.used, &stage.tables, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1666,7 +1662,7 @@ impl State {
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
-            let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+            let memory = if stage.uses_memory {
                 // Only through a store by address: what it stores through
                 // views is declared with them.
                 let use_ = if crate::pipeline::is_builder(self.pipeline as This) || writes && t.stores_by_address {
@@ -1767,10 +1763,14 @@ impl State {
                     };
                     // The shader adds the bytes a raw view begins early by.
                     let biased = srv
-                        && t.host.user_data.iter().any(|u| {
-                            u.slot == slot
-                                && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
-                        });
+                        && if slot < 64 {
+                            stage.biased_srvs & (1u64 << slot) != 0
+                        } else {
+                            t.host.user_data.iter().any(|u| {
+                                u.slot == slot
+                                    && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
+                            })
+                        };
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
                             return false;
@@ -3335,85 +3335,71 @@ impl State {
         &mut self,
         list: &HostList,
         used: &[UsedResource],
-        indexed: &[RootIndexedView],
-        half: &[(u8, u32)],
+        plan: &crate::pipeline::host::StageTablePlan,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Few<u8, 16> = Few::default();
-        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
-            if !fresh.contains(&u.slot) {
-                fresh.push(u.slot);
-            }
+        if plan.slots.is_empty() {
+            return Few::default();
         }
-        // The view shown in place of the title's at dword `at` of the table
-        // in root parameter `slot`, if the shader moves halves there and
-        // the title's view is a 16-bit float or signed buffer view.
-        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
-            if !half.contains(&(slot, at)) {
-                return None;
-            }
-            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
-                return None;
-            };
-            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
-        };
-        for &(slot, at) in half {
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-                continue;
-            };
-            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
-                continue;
-            };
-            if crate::descriptor::host::half_view(&view).is_some() {
-                if !fresh.contains(&slot) {
-                    fresh.push(slot);
+        let mut fresh_flags: Few<bool, 16> = Few::default();
+        for sp in &plan.slots {
+            let mut is_fresh = sp.has_cbv;
+            let bound_table = self.roots_ref(compute).get(usize::from(sp.slot)).and_then(|r| match *r {
+                Root::Table(table) => Some(table),
+                _ => None,
+            });
+            if !sp.half_dwords.is_empty()
+                && let Some(table) = bound_table
+            {
+                for &at in &sp.half_dwords {
+                    let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                        continue;
+                    };
+                    if crate::descriptor::host::half_view(&view).is_some() {
+                        is_fresh = true;
+                    } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                        once!(
+                            format,
+                            "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                        );
+                    }
                 }
-            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
-                once!(
-                    format,
-                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
-                );
             }
+            // Tables reaching past a host heap smaller than the title's (the
+            // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
+            // title's slots there have no host slot of their own.
+            if !is_fresh
+                && !sp.used_indices.is_empty()
+                && let Some(table) = bound_table
+                && let Some(heap) = self.heap_of(table)
+                && let Some(host) = heap.host()
+            {
+                let limit = host.count();
+                for &ui in &sp.used_indices {
+                    let end = table + u64::from(used[ui].table_offset_dwords) * 4;
+                    if heap.index(end).is_some_and(|index| index >= limit) {
+                        is_fresh = true;
+                        break;
+                    }
+                }
+            }
+            fresh_flags.push(is_fresh);
         }
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
-            };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
-                continue;
-            };
-            if index >= host.count() {
-                fresh.push(u.slot);
-            }
-        }
-        fresh.sort_unstable();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+        for &(sp_idx, ui) in &plan.direct_order {
+            if !fresh_flags[sp_idx] {
+                self.table_entry(list, &used[ui], compute);
             }
         }
         let mut made = Few::default();
-        for &slot in fresh.iter() {
+        let mut dyn_selected: Few<u32, 16>;
+        for (sp_idx, sp) in plan.slots.iter().enumerate() {
+            if !fresh_flags[sp_idx] {
+                continue;
+            }
+            let slot = sp.slot;
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            // (Their places among `used`.)
-            let mut places: Few<u16, 32> = Few::default();
-            for (i, _) in used.iter().enumerate().filter(|(_, u)| tables(u) && u.slot == slot) {
-                places.push(i as u16);
-            }
-            let entries = || places.iter().map(|&i| &used[usize::from(i)]);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3423,10 +3409,11 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
+            let selected: &[u32] = if sp.indexed.is_empty() {
+                &sp.half_indices
+            } else {
+                dyn_selected = Few::default();
+                for index in &sp.indexed {
                     let constant = self.user_value(
                         compute,
                         index.constant_slot,
@@ -3434,26 +3421,22 @@ impl State {
                         index.constant_dword,
                     );
                     // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            // The descriptors the shader moves halves through are made too,
-            // and the table reaches them: they may lie past the range starts
-            // the entries give (a range of several views names only its
-            // first; review on #927).
-            selected.extend(
-                half.iter()
-                    .filter(|&&(s, _)| s == slot)
-                    .map(|&(_, at)| at / 8),
-            );
-            selected.sort_unstable();
-            selected.dedup();
-            let n = entries()
-                .map(|u| u.table_offset_dwords / 8)
-                .chain(selected.last().copied())
-                .max()
-                .unwrap_or(0)
-                + 1;
+                    dyn_selected.push(index.byte_offset.wrapping_add(constant << index.shift) / 32);
+                }
+                for &h in &sp.half_indices {
+                    dyn_selected.push(h);
+                }
+                dyn_selected.sort_unstable();
+                let mut write = 0usize;
+                for read in 0..dyn_selected.len() {
+                    if write == 0 || dyn_selected[read] != dyn_selected[write - 1] {
+                        dyn_selected[write] = dyn_selected[read];
+                        write += 1;
+                    }
+                }
+                &dyn_selected[..write]
+            };
+            let n = sp.static_max.max(selected.last().copied().unwrap_or(0)) + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3464,14 +3447,22 @@ impl State {
             // The table and what its entries hold (record words).
             let key = {
                 let mut h = RecordHash::default();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
-                    // (Another table than the same slots made for a shader
-                    // that reads them in the title's formats.)
-                    if half.contains(&(slot, k * 8)) {
-                        h.add([u32::MAX, slot.into(), k]);
+                if sp.half_dwords.is_empty() {
+                    for k in 0..n {
+                        let at = table + u64::from(k) * 32;
+                        // SAFETY: a descriptor slot in title memory.
+                        h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    }
+                } else {
+                    for k in 0..n {
+                        let at = table + u64::from(k) * 32;
+                        // SAFETY: a descriptor slot in title memory.
+                        h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                        // (Another table than the same slots made for a shader
+                        // that reads them in the title's formats.)
+                        if sp.half_dwords.binary_search(&(k * 8)).is_ok() {
+                            h.add([u32::MAX, slot.into(), k]);
+                        }
                     }
                 }
                 (table, n, h.0)
@@ -3482,7 +3473,7 @@ impl State {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && entries().all(|u| u.kind != ResourceType::Uav);
+                let once = ready_once() && selected.is_empty() && !sp.has_uav;
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
@@ -3495,14 +3486,18 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
+                for &ui in &sp.used_indices {
+                    let u = &used[ui];
+                    if u.kind == ResourceType::Cbv {
+                        continue;
+                    }
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
-                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
+                for &k in selected {
+                    if sp.first_at.binary_search_by_key(&k, |&(idx, _)| idx).is_ok() {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3545,8 +3540,16 @@ impl State {
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k)) {
-                    host.slot_tabled(title + k);
+                if n <= 64 {
+                    for k in 0..n {
+                        host.slot_tabled(title + k);
+                    }
+                } else {
+                    for &(k, _) in &sp.first_at {
+                        if k < n {
+                            host.slot_tabled(title + k);
+                        }
+                    }
                 }
             }
             let list_views = crate::descriptor::host::list_views();
@@ -3555,18 +3558,27 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let has_half = !sp.half_dwords.is_empty();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                let is_half = has_half && sp.half_dwords.binary_search(&(k * 8)).is_ok();
+                let used_entry = sp
+                    .first_at
+                    .binary_search_by_key(&k, |&(idx, _)| idx)
+                    .ok()
+                    .map(|p| &used[sp.first_at[p].1]);
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
+                // Bypass for half-format slots so `half_view` reinterpretation
+                // is never skipped by an unmodified listed descriptor.
                 if list_views
+                    && !is_half
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
-                    let kind = entries()
-                        .find(|u| u.table_offset_dwords / 8 == k)
+                    let kind = used_entry
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                     let was = (listed.ready, listed.tabled);
@@ -3601,7 +3613,6 @@ impl State {
                     }
                     continue;
                 }
-                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
@@ -3613,11 +3624,12 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        match halved(self, slot, k * 8) {
-                            Some(shown) => host.make_at(index, &shown),
-                            None => host.make_at(index, &view),
+                        if is_half && let Some(shown) = crate::descriptor::host::half_view(&view) {
+                            host.make_at(index, &shown);
+                        } else {
+                            host.make_at(index, &view);
                         }
-                        let kind = used.map(|u| u.kind).or_else(|| {
+                        let kind = used_entry.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
@@ -3639,7 +3651,7 @@ impl State {
                     }
                     None => {
                         host.make_null(index);
-                        if used.is_some() {
+                        if used_entry.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }

@@ -338,9 +338,19 @@ pub(crate) fn sync_heaps() {
         mirrored += before.len() as u64 - of_tables;
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
+        // Only watch the mirrored prefix `[start, start + mirrored_count * step)`:
+        // on capped NVIDIA heaps (e.g. 500k mirrored out of 1.24M title slots),
+        // asking/reading the unmirrored tail wastes ~50% of sync_heaps time.
+        let mirror_end = start
+            .checked_add(u64::from(mirrored_count).saturating_mul(step))
+            .map_or(end, |m| m.min(end));
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
-        let taken = written.take(start as usize, end as usize);
+        let taken = if mirror_end > start {
+            written.take(start as usize, mirror_end as usize)
+        } else {
+            Vec::new()
+        };
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
@@ -626,6 +636,45 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
+    }
+}
+
+/// Gives back a batch of `(heap, first, n)` dynamic ranges, acquiring
+/// `SHADER_HEAPS` once and each host heap's allocator lock once per heap.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_many(ranges: &[(usize, u32, u32)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // Common case: every dynamic allocation in a list belongs to one view heap.
+    let first_heap = ranges[0].0;
+    if ranges.iter().all(|&(h, _, _)| h == first_heap) {
+        if heaps.iter().any(|&(_, _, h)| h == first_heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(first_heap as *const Heap) }.host.get()
+        {
+            let mut batch: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+            batch.extend(ranges.iter().map(|&(_, first, n)| (first, n)));
+            host.release_many(&batch);
+        }
+        return;
+    }
+    let mut by_heap: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+    for &(heap, first, n) in ranges {
+        if let Some((_, list)) = by_heap.iter_mut().find(|(h, _)| *h == heap) {
+            list.push((first, n));
+        } else {
+            by_heap.push((heap, vec![(first, n)]));
+        }
+    }
+    for (heap, batch) in by_heap {
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_many(&batch);
+        }
     }
 }
 
@@ -1733,7 +1782,8 @@ mod tests {
             user_data: 4,
             slot: 1,
         };
-        let made = state.tables(&list, &[range], &[], &[(1, 8)], true);
+        let plan = crate::pipeline::host::StageTablePlan::new(&[range], &[], &[(1, 8)]);
+        let made = state.tables(&list, &[range], &plan, true);
         let [(1, offset)] = made[..] else {
             panic!("one fresh table for root parameter 1, not {:?}", &made[..]);
         };

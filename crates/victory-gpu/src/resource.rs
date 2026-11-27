@@ -1299,6 +1299,31 @@ fn max_dim_base_for(desc: &ResourceDesc, limit: u32) -> u32 {
     base_level(desc, shift)
 }
 
+/// Textures capped by `VICTORY_MAX_TEXTURE_DIM`: `[count, kept_bytes, full_bytes]`.
+#[cfg(windows)]
+static MAX_DIM_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Logs cumulative VRAM saved by `VICTORY_MAX_TEXTURE_DIM` when active.
+#[cfg(windows)]
+pub(crate) fn max_dim_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(limit) = max_texture_dim() else {
+        return;
+    };
+    let count = MAX_DIM_STATS[0].load(Relaxed);
+    if count == 0 {
+        return;
+    }
+    let kept = MAX_DIM_STATS[1].load(Relaxed);
+    let full = MAX_DIM_STATS[2].load(Relaxed);
+    tracing::info!(
+        "textures capped by VICTORY_MAX_TEXTURE_DIM={limit}: {count} made so far, {} MB kept of {} MB full ({} MB saved)",
+        kept >> 20,
+        full >> 20,
+        full.saturating_sub(kept) >> 20,
+    );
+}
+
 #[cfg(windows)]
 pub(crate) fn max_dim_base(desc: &ResourceDesc) -> u32 {
     max_texture_dim().map_or(0, |limit| max_dim_base_for(desc, limit))
@@ -1667,6 +1692,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             HELD[0].fetch_add(1, Relaxed);
             HELD[1].fetch_add(host.bytes, Relaxed);
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
+        }
+        if dim_cap_base > 0 {
+            let full = footprint(&r.desc).map_or(0, |f| f.size);
+            let kept = if host.bytes > 0 {
+                host.bytes
+            } else {
+                footprint(&r.desc.from_level(dim_cap_base)).map_or(0, |f| f.size)
+            };
+            MAX_DIM_STATS[0].fetch_add(1, Relaxed);
+            MAX_DIM_STATS[1].fetch_add(kept, Relaxed);
+            MAX_DIM_STATS[2].fetch_add(full, Relaxed);
         }
         host.filled = fills(&r.desc);
         if host.filled {

@@ -1204,6 +1204,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Fast flag set when `twin_use` marks any twin `writing = true`, so
+    /// `twins_written()` skips locking `twins` on the 99% of draws that do not
+    /// write a depth-texture UAV twin.
+    has_writing_twin: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -3393,8 +3397,9 @@ struct RelayFetch {
     buffer: Option<(ID3D12Resource, usize, u64)>,
     /// Pieces caught while a later flight was writing them.
     suspects: torn::Suspects,
-    /// What earlier fetches brought of flights not landed yet.
-    had: crate::land::Had,
+    /// What earlier fetches brought of flights not landed yet (only tracked on
+    /// the direct queue, where `ahead` is non-zero).
+    had: Option<crate::land::Had>,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -4103,6 +4108,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                has_writing_twin: std::sync::atomic::AtomicBool::new(false),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -4620,6 +4626,7 @@ impl Host {
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
+            let had = queue.is_none().then(crate::land::Had::default);
             Some(RelayFetch {
                 list,
                 queue,
@@ -4628,7 +4635,7 @@ impl Host {
                 sent: 0,
                 buffer: None,
                 suspects: torn::Suspects::default(),
-                had: crate::land::Had::default(),
+                had,
             })
         }
     }
@@ -4654,57 +4661,61 @@ impl Host {
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
-        if let (Some(fetch), Some(first)) = (fetch.as_mut(), plans.iter().map(|p| p.1).min()) {
-            fetch.had.landing(first);
+        if let (Some(fetch), Some(first)) = (fetch.as_mut(), plans.iter().map(|p| p.1).min())
+            && let Some(had) = fetch.had.as_mut()
+        {
+            had.landing(first);
         }
         // SAFETY: the mapping of the results. The compares of these plans
         // have run, and their dwords are given to no other plan before these
         // are done with (`card_done`).
         let differs = differs.map(|(differs, dwords)| unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) });
         if let Some(differs) = differs {
-            // Pieces caught while a later flight was at them (`torn`).
+            // Pieces caught while a later flight was writing them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
+            let mut wanted = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
-                let flags: Vec<(usize, u32, bool)> = plan
-                    .ranges
-                    .iter()
-                    .filter(|r| !r.picked)
-                    .flat_map(|r| {
-                        (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
-                            let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted)
-                        })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
+                wanted.clear();
+                for r in plan.ranges.iter().filter(|r| !r.picked) {
+                    let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    let id = r.shadow.id();
+                    for p in 0..r.span.pieces {
+                        let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
+                        let want = suspects.map_or(flagged, |s| s.wanted((id, r.span.first + p), flagged));
+                        if want {
+                            wanted.insert((copy, r.span.first + p));
+                        }
+                    }
+                }
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
-                    for p in 0..r.span.pieces {
-                        if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
-                            continue;
-                        }
-                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && !seen.contains(&(copy, lo, hi)) {
-                            let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
-                            if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
-                                land::count(land::stat::HAD, 1);
-                                land::count(land::stat::HAD_BYTES, (hi - lo) as u64);
-                                if land::skip_on() {
-                                    continue;
+                    if !wanted.is_empty() {
+                        for p in 0..r.span.pieces {
+                            if !wanted.contains(&(copy, r.span.first + p)) {
+                                continue;
+                            }
+                            let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                            if lo < hi && !seen.contains(&(copy, lo, hi)) {
+                                let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
+                                if fetch.as_ref().and_then(|f| f.had.as_ref()).is_some_and(|h| h.holds(behind, key)) {
+                                    land::count(land::stat::HAD, 1);
+                                    land::count(land::stat::HAD_BYTES, (hi - lo) as u64);
+                                    if land::skip_on() {
+                                        continue;
+                                    }
                                 }
+                                if upcheck::on() {
+                                    upcheck::fetched(r.shadow.id(), lo);
+                                }
+                                seen.insert((copy, lo, hi));
+                                pieces.push((r.shadow.clone(), lo, hi, total));
+                                total += (hi - lo) as u64;
                             }
-                            if upcheck::on() {
-                                upcheck::fetched(r.shadow.id(), lo);
-                            }
-                            seen.insert((copy, lo, hi));
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -4858,9 +4869,10 @@ impl Host {
                     }
                 }
                 let mut notes = land::Notes::default();
+                let mut addressed = Vec::new();
                 for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    addressed.clear();
+                    addressed.extend(run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)));
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
@@ -4892,10 +4904,12 @@ impl Host {
             if let Some(check) = &check {
                 check.done(&mut f.suspects);
             }
-            f.had.fetched(
-                ahead,
-                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
-            );
+            if let Some(had) = f.had.as_mut() {
+                had.fetched(
+                    ahead,
+                    pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
+                );
+            }
         }
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
@@ -6167,38 +6181,140 @@ impl Host {
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
+    /// Uses a thread-local scratch CPU heap (64 slots) so concurrent thin
+    /// command-list workers never wrap or overwrite each other's handles.
     pub(crate) fn rtv(
         &self,
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        use windows::core::Interface;
+        struct LocalRtv {
+            device_key: usize,
+            _heap: ID3D12DescriptorHeap,
+            start: usize,
+            step: usize,
+            next: u32,
+        }
+        const LOCAL_RTV: u32 = 64;
+        thread_local! {
+            static LOCAL: std::cell::RefCell<Option<LocalRtv>> = const { std::cell::RefCell::new(None) };
+        }
+        let dev_key = self.device.as_raw() as usize;
+        let handle = LOCAL.with(|cell| {
+            let mut slot_heap = cell.borrow_mut();
+            let rebuild = slot_heap.as_ref().is_none_or(|h| h.device_key != dev_key);
+            if rebuild {
+                // SAFETY: non-shader-visible CPU descriptor heap for this device.
+                let heap: Option<ID3D12DescriptorHeap> = unsafe {
+                    self.device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                            NumDescriptors: LOCAL_RTV,
+                            ..Default::default()
+                        })
+                        .ok()
+                };
+                *slot_heap = heap.map(|heap| {
+                    // SAFETY: live heap just created above.
+                    let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
+                    LocalRtv {
+                        device_key: dev_key,
+                        _heap: heap,
+                        start,
+                        step: self.rtv_size as usize,
+                        next: 0,
+                    }
+                });
+            }
+            slot_heap.as_mut().map(|h| {
+                let idx = h.next % LOCAL_RTV;
+                h.next = h.next.wrapping_add(1);
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.start + idx as usize * h.step }
+            })
+        });
+        let handle = handle.unwrap_or_else(|| {
+            let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+            // SAFETY: fallback to shared host RTV ring.
+            let mut h = unsafe { self.rtvs.GetCPUDescriptorHandleForHeapStart() };
+            h.ptr += (slot * self.rtv_size) as usize;
+            h
+        });
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 
     /// A host depth view of `resource`, valid until it is recorded.
+    /// Uses a thread-local scratch CPU heap (16 slots) so concurrent thin
+    /// command-list workers never wrap or overwrite each other's handles.
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        use windows::core::Interface;
+        struct LocalDsv {
+            device_key: usize,
+            _heap: ID3D12DescriptorHeap,
+            start: usize,
+            step: usize,
+            next: u32,
+        }
+        const LOCAL_DSV: u32 = 16;
+        thread_local! {
+            static LOCAL: std::cell::RefCell<Option<LocalDsv>> = const { std::cell::RefCell::new(None) };
+        }
+        let dev_key = self.device.as_raw() as usize;
+        let handle = LOCAL.with(|cell| {
+            let mut slot_heap = cell.borrow_mut();
+            let rebuild = slot_heap.as_ref().is_none_or(|h| h.device_key != dev_key);
+            if rebuild {
+                // SAFETY: non-shader-visible CPU descriptor heap for this device.
+                let heap: Option<ID3D12DescriptorHeap> = unsafe {
+                    self.device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                            NumDescriptors: LOCAL_DSV,
+                            ..Default::default()
+                        })
+                        .ok()
+                };
+                *slot_heap = heap.map(|heap| {
+                    // SAFETY: live heap just created above.
+                    let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
+                    LocalDsv {
+                        device_key: dev_key,
+                        _heap: heap,
+                        start,
+                        step: self.dsv_size as usize,
+                        next: 0,
+                    }
+                });
+            }
+            slot_heap.as_mut().map(|h| {
+                let idx = h.next % LOCAL_DSV;
+                h.next = h.next.wrapping_add(1);
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.start + idx as usize * h.step }
+            })
+        });
+        let handle = handle.unwrap_or_else(|| {
+            let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+            // SAFETY: fallback to shared host DSV ring.
+            let mut h = unsafe { self.dsvs.GetCPUDescriptorHandleForHeapStart() };
+            h.ptr += (slot * self.dsv_size) as usize;
+            h
+        });
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 }
 
@@ -6341,6 +6457,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.has_writing_twin.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6494,7 +6611,10 @@ impl HostList {
             // Shaders write the twin when the draw or dispatch runs: what
             // the same one reads of the depth texture is prepared before
             // (`twins_written`).
-            (true, true) => u.writing = true,
+            (true, true) => {
+                u.writing = true;
+                self.has_writing_twin.store(true, Ordering::Release);
+            }
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
@@ -6630,6 +6750,9 @@ impl HostList {
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
+        if !self.has_writing_twin.swap(false, Ordering::AcqRel) {
+            return;
+        }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
@@ -8741,6 +8864,7 @@ impl Meter {
         );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::resource::max_dim_line();
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);

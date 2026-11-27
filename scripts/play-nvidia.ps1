@@ -28,7 +28,7 @@ param(
     [switch]$Thin,
     [switch]$LevelsOnDemand,
     [switch]$Panel,
-    [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
+    [ValidateSet('2160', '1440', '1080', '720', '540', '480', '420', '360')][string]$Resolution,
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},

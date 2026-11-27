@@ -2,14 +2,15 @@
 #   scripts\play-rtx3050-xeon.ps1 [-Resolution 480|540|720] [-Quality] [-Thin] [-Panel] [-SmoothMotion] [-LegacySubmit]
 param(
     [string]$Exe = 'C:\GTA.6.Recomp-InsaneRamZes\Game\game_scarlett_master.exe',
-    [ValidateSet('1080', '720', '540', '480')][string]$Resolution = '540',
+    [ValidateSet('1080', '720', '540', '480', '420', '360')][string]$Resolution = '540',
     [switch]$Quality,
     [switch]$Thin,
     [switch]$Panel,
     [switch]$SmoothMotion,
     [switch]$RayTracing,
     [switch]$LegacySubmit,
-    [int]$MaxTexDim = 1024,
+    [switch]$FullAmbient,
+    [int]$MaxTexDim = 512,
     [string]$LogFile,
     [switch]$NoLog,
     [ValidateSet('diag', 'release')][string]$Build = 'release',
@@ -38,11 +39,12 @@ $tuned = @{
     # - Move hottest 512 MiB of read-only vertex/index/constant windows into GDDR6 VRAM (breaks 6% GDDR6 / 52W PCIe stall!).
     VICTORY_LEVELS_ON_DEMAND = '1'
     VICTORY_MAX_TEXTURE_DIM = $MaxTexDim.ToString([Globalization.CultureInfo]::InvariantCulture)
-    VICTORY_CARD_BUFFERS_MIN_MB = '1'
-    VICTORY_CARD_BUFFERS_MB = '1280'
-    VICTORY_CARD_WINDOWS_MB = '512'
+    VICTORY_CARD_BUFFERS_MIN_KB = '256'
+    VICTORY_CARD_BUFFERS_MB = '1536'
+    VICTORY_CARD_WINDOWS_MB = '768'
     VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1800'
-    VICTORY_TEXTURE_ROOM_PERCENT = '88'
+    VICTORY_TEXTURE_ROOM_PERCENT = '85'
+    VICTORY_AMBIENT_HALF = if ($FullAmbient) { '0' } else { '1' }
     # Xeon E5-2650 v3 (10c/20t Haswell, 25 MB L3) right-sized worker pools:
     VICTORY_DSTORAGE_THREADS = '6'
     VICTORY_LAND_THREADS = '5'
@@ -92,7 +94,8 @@ if ($Panel) { $pass.Panel = $true }
 if ($RayTracing) { $pass.RayTracing = $true }
 
 Write-Host "=== VortexBox RTX 3050 8GB + Xeon E5-2650 v3 (10c/20t) Profile ($Build) ==="
-Write-Host "VRAM: Levels-On-Demand ON | MaxTexDim=${MaxTexDim}px | CardBuf >=1MB (1280MB) | CardWin 512MB | TexRoom 88%"
+Write-Host "VRAM: Levels-On-Demand ON | MaxTexDim=${MaxTexDim}px | CardBuf >=256KB (1536MB) | CardWin 768MB | TexRoom 85%"
+Write-Host "GPU : AmbientHalf=$(-not $FullAmbient) | RenderScale=${Resolution}p -> 1080p Temporal Upscaler"
 Write-Host "CPU : Async Submit ON | Thin=$([bool]$Thin) | Wide/Land=5t Under/View=4t DStorage=6t | Spin=0 | TitlePrio=1"
 Write-Host "OPT : Kelvaroq 0053+0055=$(if ($LegacySubmit) { 'OFF (-LegacySubmit)' } else { 'ON (Scratch/BatchGuards/SplitCopy/BatchUploads/BufferSpans)' })"
 if ($LogFile) { Write-Host "LOG : $LogFile" }

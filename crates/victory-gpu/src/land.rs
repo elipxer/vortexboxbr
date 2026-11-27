@@ -563,12 +563,26 @@ impl Notes {
         let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
         TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
         if taken() {
+            self.landed.sort_unstable_by_key(|l| l.0);
             for (block, before) in blocks {
-                let mut through = self.landed.iter().filter(|l| l.0 == block).map(|l| l.1);
-                let Some(copy) = through.next() else {
+                let start = self.landed.partition_point(|l| l.0 < block);
+                let Some(&(b, copy)) = self.landed.get(start) else {
                     continue;
                 };
-                if !copy.is_null() && through.all(|other| other == copy) {
+                if b != block || copy.is_null() {
+                    continue;
+                }
+                let mut sole = true;
+                for &(other_b, other_c) in &self.landed[start + 1..] {
+                    if other_b != block {
+                        break;
+                    }
+                    if other_c != copy {
+                        sole = false;
+                        break;
+                    }
+                }
+                if sole {
                     // SAFETY: the job holds its copies until this is done.
                     let copy = unsafe { &*copy };
                     TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now)), Ordering::Relaxed);
