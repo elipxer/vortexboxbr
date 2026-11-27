@@ -22,7 +22,7 @@ param(
     # the title; 4k: the stock Series X output (3840x2160).
     [ValidateSet('1440', '1080to1440', '4k')][string]$Res = '1440',
     # DLSS Super Resolution in place of the title's upscaling; needs NVIDIA Streamline (README).
-    [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'quality',
+    [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance', 'ultraperformance')][string]$Dlss = 'quality',
     # DLSS Frame Generation (RTX 40 or later, hardware-accelerated GPU scheduling on); needs DLSS.
     [switch]$FrameGen,
     # Frames shown for each one rendered with -FrameGen: 2 to 6 (more than 2 needs an RTX 50; the layer asks the
@@ -59,7 +59,7 @@ if (Test-Path -LiteralPath $menuFile) {
 $fpsWanted = $Fps
 if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CONSOLE'] -eq 'series-s' }
 if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
-if ($menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance') { $Dlss = $menu['VICTORY_MENU_DLSS'] }
+if ($menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance', 'ultraperformance') { $Dlss = $menu['VICTORY_MENU_DLSS'] }
 $timesWanted = $FrameGenX
 if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
     # 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).

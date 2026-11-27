@@ -95,7 +95,7 @@ const KEPT: &[&str] = &[
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
 const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
-const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
+const DLSS_MODES: [&str; 6] = ["off", "dlaa", "quality", "balanced", "performance", "ultraperformance"];
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
