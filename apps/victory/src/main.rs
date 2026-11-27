@@ -125,6 +125,10 @@ enum Command {
         /// Only the pipelines earlier runs drew with.
         #[arg(long)]
         used: bool,
+        /// Also store the early and slow pipelines into `host-pipelines.bin`
+        /// so the next launch loads them immediately at startup.
+        #[arg(long)]
+        library: bool,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
@@ -283,7 +287,13 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, library, these } => {
+            warm::run(jobs, limit, again, used, these)?;
+            if library {
+                warm::into_library(jobs)?;
+            }
+            Ok(())
+        }
         #[cfg(windows)]
         Command::Preload { paths } => {
             play::explain_preload();

@@ -80,7 +80,7 @@ $fxDir = $fxCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -Path
 
 $fgActive = [bool]$FsrFrameGen
 $dlssActive = ($Dlss -ne 'off') -and [bool]$slDir
-$texRoom = if ($fgActive) { '80' } elseif ($dlssActive -or -not $NoFrameGenReady) { '84' } else { '86' }
+$texRoom = if ($fgActive) { '85' } elseif ($dlssActive -or -not $NoFrameGenReady) { '86' } else { '88' }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
 
 $settings = [ordered]@{
@@ -135,8 +135,8 @@ $settings = [ordered]@{
     VICTORY_QUEUE_HOST_TEXTURES = '0'
     VICTORY_MAX_TEXTURE_DIM = $MaxTexDim.ToString([Globalization.CultureInfo]::InvariantCulture)
     VICTORY_CARD_BUFFERS_MIN_KB = '256'
-    VICTORY_CARD_BUFFERS_MB = '1024'
-    VICTORY_CARD_WINDOWS_MB = '256'
+    VICTORY_CARD_BUFFERS_MB = '640'
+    VICTORY_CARD_WINDOWS_MB = '128'
     VICTORY_WINDOWS_BAR_MB = '0'
     VICTORY_TEXTURE_ROOM_PERCENT = $texRoom
 
@@ -158,7 +158,9 @@ $settings = [ordered]@{
     VICTORY_WIDE_THREADS = '5'
     VICTORY_WIDE_SPIN = '0'
     VICTORY_LAND_SKIP = '1'
-    VICTORY_PIPELINE_WORKERS = '3'
+    VICTORY_PIPELINE_WORKERS = '6'
+    # Never stall gameplay frames for 500 ms waiting on cold non-screen PSO compiles.
+    VICTORY_PIPELINE_WAIT_MS = '16'
 
     # Record used pipelines for `victory warm --used` + HUD counters
     VICTORY_PIPELINE_BOOK = '1'
@@ -233,7 +235,7 @@ if (-not $NoLog) {
 }
 
 Write-Host "=== VortexBoxBR Wave 5 (Foxhound+CGBJ) | RTX 3050 8GB + Xeon E5-2650 v3 [$Build] ==="
-Write-Host "VRAM: PeakTargetRoom (PR#76) | LevelsOnDemand | MaxTexDim=${MaxTexDim}px | CardBuf 1024MB | CardWin 256MB | TexRoom ${texRoom}%"
+Write-Host "VRAM: PeakTargetRoom (PR#76) | LevelsOnDemand | MaxTexDim=${MaxTexDim}px | CardBuf 640MB | CardWin 128MB | TexRoom ${texRoom}%"
 Write-Host "UPS : Console=$console | DLSS=$(if ($dlssActive) { $Dlss } else { 'OFF' }) | AMD FSR 3 FG=$(if ($fgActive -and $fxDir) { "${FrameGenX}x (HUD-less)" } elseif ($fxDir -and -not $NoFrameGenReady) { 'READY (F1)' } else { 'OFF' }) | FpsCap=$Fps"
 Write-Host "GPU : EarlyDepth=1 | ThreadTicket=1 | AmbientSpecular=1 | AmbientHalf=$([bool]$HalfAmbient) | WaterLight=SKIP | LeaveOut=ON | RT=$([bool]$RayTracing)"
 Write-Host "CPU : Thin=$(-not $NoThin)(8t) | WcNoBack=1 | SoftViews=copies | HeapSync(5x)+BufSpans=1 | RefreshScratch=1 | DStorage=6t | NoWatchdog=1"
