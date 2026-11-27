@@ -9322,6 +9322,7 @@ impl Meter {
         crate::indirect::merge::line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::resource::max_dim_line();
         late_line(frames);
         crate::queue::behind_line(frames);
         crate::streamline::line(frames);

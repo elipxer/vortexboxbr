@@ -1343,6 +1343,70 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// Optional maximum texture width/height for read-only title-filled 2D
+/// textures (`VICTORY_MAX_TEXTURE_DIM=<px>`, e.g. `1024`; `0` or unset = off).
+/// Drops top mip levels above the cap to cut VRAM and staging pressure on 8 GB
+/// GPUs while preserving normalized UVs and block alignment.
+#[cfg(windows)]
+pub(crate) fn max_texture_dim() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let v = std::env::var("VICTORY_MAX_TEXTURE_DIM")
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        (v > 0).then(|| v.max(64))
+    })
+}
+
+/// First mip level to retain so a read-only 2D texture does not exceed `limit`
+/// on either side, preserving whole compression blocks via [`base_level`].
+#[cfg(windows)]
+fn max_dim_base_for(desc: &ResourceDesc, limit: u32) -> u32 {
+    if limit == 0 || desc.mip_levels <= 1 {
+        return 0;
+    }
+    let max_mip = u32::from(desc.mip_levels) - 1;
+    let mut shift = 0u32;
+    while shift < max_mip
+        && ((desc.width >> shift) > u64::from(limit) || (desc.height >> shift) > limit)
+    {
+        shift += 1;
+    }
+    base_level(desc, shift)
+}
+
+/// Textures capped by `VICTORY_MAX_TEXTURE_DIM`: `[count, kept_bytes, full_bytes]`.
+#[cfg(windows)]
+static MAX_DIM_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Logs cumulative VRAM saved by `VICTORY_MAX_TEXTURE_DIM` when active.
+#[cfg(windows)]
+pub(crate) fn max_dim_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(limit) = max_texture_dim() else {
+        return;
+    };
+    let count = MAX_DIM_STATS[0].load(Relaxed);
+    if count == 0 {
+        return;
+    }
+    let kept = MAX_DIM_STATS[1].load(Relaxed);
+    let full = MAX_DIM_STATS[2].load(Relaxed);
+    tracing::info!(
+        "textures capped by VICTORY_MAX_TEXTURE_DIM={limit}: {count} made so far, {} MB kept of {} MB full ({} MB saved)",
+        kept >> 20,
+        full >> 20,
+        full.saturating_sub(kept) >> 20,
+    );
+}
+
+#[cfg(windows)]
+pub(crate) fn max_dim_base(desc: &ResourceDesc) -> u32 {
+    max_texture_dim().map_or(0, |limit| max_dim_base_for(desc, limit))
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
@@ -1431,7 +1495,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    let target = base_level(&r.desc, first).max(max_dim_base(&r.desc));
+    if host.base == 0 || host.base <= target {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1678,6 +1743,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
+        let dim_cap_base = if shape_fits && alias_of(this).is_none() {
+            max_dim_base(&r.desc)
+        } else {
+            0
+        };
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
@@ -1693,7 +1763,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
-                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
+                .and_then(|(t, host)| {
+                    crate::tiles::Tiled::make_from(&host.device, t, u32::from(r.desc.mip_levels), dim_cap_base)
+                });
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
             if cut.is_some() {
@@ -1702,15 +1774,19 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
+        // pick by index among them, plus optional `VICTORY_MAX_TEXTURE_DIM` cap
+        // on non-tiled read-only 2D textures.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
-            let wanted = r.host.wanted.load(Relaxed);
-            let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
-            let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
+        if texture.is_none() && shape_fits && alias_of(this).is_none() {
+            if r.host.placed.load(Relaxed) && held_only() {
+                let wanted = r.host.wanted.load(Relaxed);
+                let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
+                let first = wanted.min(viewed);
+                if first != u32::MAX {
+                    base = base_level(&r.desc, first);
+                }
             }
+            base = base.max(dim_cap_base);
         }
         let texture = match texture {
             Some(texture) => Some(texture),
@@ -1743,6 +1819,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             HELD[0].fetch_add(1, Relaxed);
             HELD[1].fetch_add(host.bytes, Relaxed);
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
+        }
+        if dim_cap_base > 0 {
+            let full = footprint(&r.desc).map_or(0, |f| f.size);
+            let kept = if host.bytes > 0 {
+                host.bytes
+            } else {
+                footprint(&r.desc.from_level(dim_cap_base)).map_or(0, |f| f.size)
+            };
+            MAX_DIM_STATS[0].fetch_add(1, Relaxed);
+            MAX_DIM_STATS[1].fetch_add(kept, Relaxed);
+            MAX_DIM_STATS[2].fetch_add(full, Relaxed);
         }
         host.filled = fills(&r.desc);
         if host.filled {
@@ -1885,7 +1972,23 @@ pub(crate) fn targets_room_kept() -> u64 {
     let (last, since) = targets_seen(last, since, targets, now);
     GREW[0].store(last, Relaxed);
     GREW[1].store(since, Relaxed);
-    targets_kept(most, targets, now.saturating_sub(since), settle)
+    let settled = targets_kept(most, targets, now.saturating_sub(since), settle);
+    static FLAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FLAT.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_TARGETS_MB").is_some()) {
+        return settled;
+    }
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+    let peak = PEAK.fetch_max(targets, Relaxed).max(targets);
+    settled.min(targets_kept_from_peak(most, targets, peak))
+}
+
+/// What [`targets_room_kept`] keeps of `most` without the flat switch (PR #76):
+/// half as much again as targets have held at their peak (at least 256 MiB,
+/// capped by `most`), minus current targets.
+#[cfg(any(windows, test))]
+fn targets_kept_from_peak(most: u64, targets: u64, peak: u64) -> u64 {
+    const LEAST: u64 = 256 << 20;
+    peak.saturating_add(peak / 2).max(LEAST).min(most).saturating_sub(targets)
 }
 
 /// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
@@ -2711,8 +2814,10 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Reserved tiled textures (`VICTORY_LEVELS_ON_DEMAND=1`)
+    // must bypass the committed pool and reach `CreateReservedResource`.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -4847,6 +4952,35 @@ float4 lit() : SV_Target { return 1.0; }
         let (last, since) = targets_seen(2400 * MIB, 1_000, 1000 * MIB, 9_000);
         assert_eq!((last, since), (1000 * MIB, 1_000));
         assert_eq!(targets_seen(last, since, 2400 * MIB, 30_000), (2400 * MIB, 30_000));
+        // PR #76 peak sizing bounds reserve on Series S while staying <= most.
+        assert_eq!(targets_kept_from_peak(most, 0, 0), 256 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 400 * MIB, 400 * MIB), 200 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 2500 * MIB, 2500 * MIB), 572 * MIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn max_dim_base_scales_large_2d_textures_safely() {
+        let mk = |w: u64, h: u32, mips: u16, flags: u32| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: w,
+            height: h,
+            depth_or_array_size: 1,
+            mip_levels: mips,
+            format: 98, // BC7_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0x105,
+            flags,
+        };
+        assert_eq!(max_dim_base_for(&mk(4096, 4096, 13, 0), 1024), 2);
+        assert_eq!(max_dim_base_for(&mk(2048, 2048, 12, 0), 1024), 1);
+        assert_eq!(max_dim_base_for(&mk(1024, 1024, 11, 0), 1024), 0);
+        assert_eq!(max_dim_base_for(&mk(4096, 4096, 13, 1), 1024), 0);
+        assert_eq!(max_dim_base_for(&mk(4096, 4096, 13, 2), 1024), 0);
+        assert_eq!(max_dim_base_for(&mk(4096, 4096, 13, 4), 1024), 0);
+        assert_eq!(max_dim_base_for(&mk(4096, 4096, 1, 0), 1024), 0);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

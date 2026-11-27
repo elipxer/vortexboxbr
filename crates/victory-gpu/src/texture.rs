@@ -1855,7 +1855,8 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
         return false;
     };
     let layout = &layout.planes[0].layout;
-    if from > crate::resource::read_from(layout, first).max(copy.base) {
+    let min_level = copy.tiled.as_ref().map_or(0, |t| t.min_level());
+    if from > crate::resource::read_from(layout, first.max(min_level)).max(copy.base) {
         return false;
     }
     let size = layout.bytes_from(from) as usize;
@@ -2120,11 +2121,13 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let texture = &copy.texture;
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
+    let on_demand_min = crate::resource::host_tiled(resource).and_then(|t| t.tiled().map(|t| t.min_level()));
+    let on_demand = on_demand_min.is_some();
+    let min_level = on_demand_min.unwrap_or(0);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
-        && s.first <= first.max(copy.base)
+        && s.first <= first.max(copy.base).max(min_level)
         && s.serial == copy.serial
     {
         return Some(s.clone());
@@ -2147,7 +2150,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let d = unsafe { texture.GetDesc() };
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
-    let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
+    let first = crate::resource::read_from(&layout, first.max(min_level)).max(level0).min(mips - 1);
     let read = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         mips - first

@@ -974,40 +974,60 @@ fn unlike(dst: This, src: This) -> bool {
 #[cfg(windows)]
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Rebases a title subresource index onto a host texture created starting at
+/// mip `base` (`VICTORY_MAX_TEXTURE_DIM` or `VICTORY_HELD_LEVELS`).
+/// `base > 0` only occurs on single-slice, single-plane 2D textures, so `sub`
+/// is the title mip index. Returns `None` if the mip was dropped or exceeds
+/// `host_mips`.
+#[cfg(any(windows, test))]
+fn rebase_subresource(sub: u32, base: u32, host_mips: u32) -> Option<u32> {
+    if base == 0 {
+        return Some(sub);
+    }
+    let host_sub = sub.checked_sub(base)?;
+    (host_sub < host_mips).then_some(host_sub)
+}
+
+#[cfg(test)]
+mod copy_rebase_tests {
+    use super::rebase_subresource;
+
+    #[test]
+    fn rebases_and_skips_dropped_top_mips() {
+        assert_eq!(rebase_subresource(0, 0, 10), Some(0));
+        assert_eq!(rebase_subresource(15, 0, 10), Some(15));
+        assert_eq!(rebase_subresource(0, 2, 9), None);
+        assert_eq!(rebase_subresource(1, 2, 9), None);
+        assert_eq!(rebase_subresource(2, 2, 9), Some(0));
+        assert_eq!(rebase_subresource(10, 2, 9), Some(8));
+        assert_eq!(rebase_subresource(11, 2, 9), None);
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        };
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
+        if let (Some(to_copy), Some(from_copy)) = (
+            crate::resource::host_copy(dst),
+            crate::resource::host_copy(src),
         ) {
             if unlike(dst, src) {
                 return;
             }
-            // Two title textures over the same memory have one host
-            // texture between them: the copy would be of that texture onto
-            // itself, which the host does not allow, and it would change
-            // nothing. It was recorded all the same, with the texture left
-            // in the source state as the copy's destination (run 205's
-            // debug layer: "CopyResource with its destination in the
-            // COPY_SOURCE state", 37 times, a 2560x1440 depth texture).
-            // Only the two state changes and the copy are left out: what
-            // is noted of the textures stays as it was. After
-            // triippywhale 6e502b3b.
+            let (to, from) = (&to_copy.texture, &from_copy.texture);
+            let (to_base, from_base) = (to_copy.base, from_copy.base);
             let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
-            // A source the title fills itself is uploaded first (upstream
-            // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
-            // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
-            // A destination made level by level gets its levels' memory
-            // ahead of this list (`crate::tiles`).
             crate::texture::card_writes(list, dst, to, None);
             crate::texture::host_written(dst);
             if same {
@@ -1027,7 +1047,53 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            unsafe {
+                if to_base == 0 && from_base == 0 {
+                    list.list.CopyResource(to, from);
+                } else {
+                    let (td, fd) = (to.GetDesc(), from.GetDesc());
+                    if to_base == from_base
+                        && td.Width == fd.Width
+                        && td.Height == fd.Height
+                        && td.MipLevels == fd.MipLevels
+                    {
+                        list.list.CopyResource(to, from);
+                    } else {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            tracing::info!(
+                                to_base,
+                                from_base,
+                                to_size = ?(td.Width, td.Height, td.MipLevels),
+                                from_size = ?(fd.Width, fd.Height, fd.MipLevels),
+                                "copy_resource between mip-rebased textures: copying overlapping mips"
+                            );
+                        });
+                        let start = to_base.max(from_base);
+                        let end = (to_base + u32::from(td.MipLevels)).min(from_base + u32::from(fd.MipLevels));
+                        for mip in start..end {
+                            let dst_sub = mip - to_base;
+                            let src_sub = mip - from_base;
+                            if (td.Width >> dst_sub).max(1) != (fd.Width >> src_sub).max(1)
+                                || (td.Height >> dst_sub).max(1) != (fd.Height >> src_sub).max(1)
+                            {
+                                continue;
+                            }
+                            let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                                pResource: std::mem::transmute_copy(to),
+                                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: dst_sub },
+                            };
+                            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                                pResource: std::mem::transmute_copy(from),
+                                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: src_sub },
+                            };
+                            list.list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+                        }
+                    }
+                }
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -1078,7 +1144,7 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(to_copy) = crate::resource::host_copy(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
             // title's buffer (`HostList::defer_read_back`).
@@ -1115,10 +1181,33 @@ extern "system" fn copy_texture_region(
         if unlike(dst.resource, src.resource) {
             return;
         }
+        let to = &to_copy.texture;
+        let dst_base = to_copy.base;
+        let host_dst_sub = if dst.kind != FOOTPRINT {
+            // SAFETY: a live resource.
+            let to_mips = u32::from(unsafe { to.GetDesc() }.MipLevels);
+            let Some(sub) = rebase_subresource(dst.footprint.offset as u32, dst_base, to_mips) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        dst = ?dst.resource,
+                        title_sub = dst.footprint.offset as u32,
+                        dst_base,
+                        to_mips,
+                        "copy_texture_region into mip dropped by VICTORY_MAX_TEXTURE_DIM / held_only skipped"
+                    );
+                });
+                return;
+            };
+            sub
+        } else {
+            dst.footprint.offset as u32
+        };
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
         let _upload; // keeps the source alive while this call records it
+        let _from_copy; // keeps the source HostTexture alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -1151,9 +1240,19 @@ extern "system" fn copy_texture_region(
             }
             _upload = buffer;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            let Some(from_copy) = crate::resource::host_copy(src.resource) else {
                 return;
             };
+            let texture = &from_copy.texture;
+            let src_base = from_copy.base;
+            if src_base > 0 {
+                // SAFETY: a live resource.
+                let from_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                let Some(sub) = rebase_subresource(src.footprint.offset as u32, src_base, from_mips) else {
+                    return;
+                };
+                from.footprint.offset = u64::from(sub);
+            }
             // The same subresource of one host texture on both sides (two
             // title textures over one memory): not a copy the host allows.
             // The states and the copy are left out below; the rest is
@@ -1161,7 +1260,7 @@ extern "system" fn copy_texture_region(
             same = texture.as_raw() == to.as_raw()
                 && src.kind != FOOTPRINT
                 && dst.kind != FOOTPRINT
-                && src.footprint.offset as u32 == dst.footprint.offset as u32;
+                && from.footprint.offset as u32 == host_dst_sub;
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
@@ -1170,6 +1269,7 @@ extern "system" fn copy_texture_region(
                 ensure_state(list, src.resource, COPY_SOURCE);
             }
             from.resource = texture.as_raw().cast_const().cast();
+            _from_copy = from_copy;
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
@@ -1211,7 +1311,7 @@ extern "system" fn copy_texture_region(
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
-        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
+        crate::texture::card_writes(list, dst.resource, to, Some(host_dst_sub));
         crate::texture::host_written(dst.resource);
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1220,6 +1320,9 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        if dst.kind != FOOTPRINT {
+            to_location.footprint.offset = u64::from(host_dst_sub);
+        }
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
@@ -1293,7 +1396,16 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
-    let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    let from_copy = crate::resource::host_copy(src.resource).ok_or("no host texture")?;
+    let texture = &from_copy.texture;
+    let host_src_sub = if from_copy.base > 0 {
+        // SAFETY: a live resource.
+        let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+        rebase_subresource(src.footprint.offset as u32, from_copy.base, mips)
+            .ok_or("source mip was dropped on the host")?
+    } else {
+        src.footprint.offset as u32
+    };
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
@@ -1304,6 +1416,7 @@ fn read_back(
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
+    from.footprint.offset = u64::from(host_src_sub);
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;
