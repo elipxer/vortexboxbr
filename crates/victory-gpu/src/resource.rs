@@ -2490,8 +2490,11 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Never divert a `reserved` (mip-on-demand) request to the
+    // ordinary placed-texture pool: `Tiled::make` rejects placed resources and
+    // would otherwise silently discard it and allocate a full-size fallback.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -4601,5 +4604,54 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A `reserved = true` request for a title-filled texture must create a
+    /// real D3D12 reserved resource (64 KiB undefined swizzle) accepted by
+    /// `Tiled::make`, never hijacked by the ordinary placed-texture pool.
+    #[cfg(windows)]
+    #[test]
+    fn reserved_texture_skips_pool_and_supports_tiling() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_DATA_D3D12_OPTIONS,
+            D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: plain feature query on live device.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        if ok.is_err() || options.TiledResourcesTier.0 < 2 {
+            return;
+        }
+        // 1024x1024 BC7, 11 levels, 64 KiB swizzle (eligible for both pool and reserved).
+        let desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 1024,
+            height: 1024,
+            depth_or_array_size: 1,
+            mip_levels: 11,
+            format: 98,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0x105,
+            flags: 0,
+        };
+        let texture = host_texture_as(&desc, 0, std::ptr::null(), true).expect("reserved texture");
+        // SAFETY: live D3D12 resource just created.
+        let d = unsafe { texture.GetDesc() };
+        assert_eq!(d.Layout, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+        assert!(
+            crate::tiles::Tiled::make(&host.device, &texture, 11).is_some(),
+            "Tiled::make must accept the reserved resource even when the texture pool is enabled"
+        );
     }
 }

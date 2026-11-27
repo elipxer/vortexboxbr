@@ -874,6 +874,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         .or_insert_with(|| (0, HeapRanges(Vec::new()), BufferPass::default()));
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+    let mut part_prior: Vec<u32> = Vec::new();
     let slots = if all {
         ranges.0.clear();
         if incremental {
@@ -882,10 +883,13 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
+        // Keep existing `BufferPass` entries intact until after `look` so
+        // unchanged slots hit `BufferPass::update`'s O(1) equality fast path
+        // instead of deleting and reinserting into `BTreeSet` every frame.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part_with(part, parts, |slot| {
             if incremental {
-                pass.update(slot, None);
+                part_prior.push(slot);
             }
         });
         let mut slots = host.buffer_slots_of(part, parts);
@@ -964,6 +968,13 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             pass.update(index, entry);
         }
         ranges.set(index, range);
+    }
+    if incremental {
+        for slot in part_prior {
+            if ranges.0.get(slot as usize).is_none_or(Option::is_none) {
+                pass.update(slot, None);
+            }
+        }
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
@@ -1474,7 +1485,6 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -2766,9 +2776,9 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -3175,8 +3185,8 @@ impl State {
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
+            && match &list.list6 {
+                Some(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
@@ -3196,7 +3206,7 @@ impl State {
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                Err(_) => false,
+                None => false,
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3932,8 +3942,8 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -4194,37 +4204,58 @@ mod thread_tests {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    thread_local! {
+        static LOCAL: std::cell::RefCell<Vec<((u32, u32), ID3D12CommandSignature)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(hit) = LOCAL.with(|local| {
+        local
+            .borrow()
+            .iter()
+            .find(|(k, _)| *k == (kind, stride))
+            .map(|(_, s)| s.clone())
+    }) {
+        return Some(hit);
+    }
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
+    let signature = if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        s.clone()
+    } else {
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument; no root arguments.
+        let result = unsafe {
+            crate::host::host()?.device.CreateCommandSignature(
+                &desc,
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )
+        };
+        if let Err(e) = result {
+            once!(error = %e, kind, stride, "host command signature refused");
+            return None;
+        }
+        let signature = signature?;
+        made.push(((kind, stride), signature.clone()));
+        signature
     };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
+    drop(made);
+    LOCAL.with(|local| {
+        if let Ok(mut local) = local.try_borrow_mut() {
+            local.push(((kind, stride), signature.clone()));
+        }
+    });
     Some(signature)
 }
 

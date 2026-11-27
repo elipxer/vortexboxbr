@@ -1186,6 +1186,9 @@ const BATCHES: u32 = 8;
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Cached `ID3D12GraphicsCommandList6` interface for `DispatchMesh`,
+    /// avoiding a COM `QueryInterface` (`cast`) on every mesh dispatch.
+    pub(crate) list6: Option<ID3D12GraphicsCommandList6>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -3677,7 +3680,6 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
 mod send;
@@ -4092,9 +4094,11 @@ impl Host {
                     ),
                 );
             }
+            let list6 = list.cast::<ID3D12GraphicsCommandList6>().ok();
             Ok(HostList {
                 allocator,
                 list,
+                list6,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -4778,8 +4782,22 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                // Coalesce adjacent pieces from the same buffer with contiguous
+                // source and packed destination offsets into one copy command.
+                let copies = check.as_ref().map_or(&pieces, |c| &c.copies);
+                let mut i = 0;
+                while i < copies.len() {
+                    let (shadow, lo, mut hi, at) = (&copies[i].0, copies[i].1, copies[i].2, copies[i].3);
+                    while let Some(next) = copies.get(i + 1)
+                        && std::sync::Arc::ptr_eq(shadow, &next.0)
+                        && next.1 == hi
+                        && next.3 == at + (hi - lo) as u64
+                    {
+                        hi = next.2;
+                        i += 1;
+                    }
+                    list.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
+                    i += 1;
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -8014,7 +8032,7 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::kept_asking();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
@@ -8645,7 +8663,6 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
-    #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
 
@@ -8677,7 +8694,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -9089,7 +9105,6 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
             let watched = crate::popwatch::take(&self.device, list, texture);
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -9128,7 +9143,6 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
             p.meter.frame(p.hwnd);
             showing.end();
@@ -9182,7 +9196,6 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
         }

@@ -206,28 +206,40 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
+groupshared float4 g_pos[64];
+groupshared float3 g_col[64];
 [RootSignature(RS)]
-[numthreads(8, 2, 1)]
-void gather(uint3 at : SV_DispatchThreadID) {
+[numthreads(8, 8, 1)]
+void gather(uint3 at : SV_DispatchThreadID, uint tid : SV_GroupIndex) {
+    bool inside = at.x < PX && at.y < PY;
     float2 size = float2(width, height);
-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+    float3 p = inside ? seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size) : 0.0;
     float r2 = 0.25 + 0.0025 * p.z * p.z;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    for (uint i = 0; i < CELLS; i++) {
-        float4 c = cells[CELLS + 1 + i];
-        float3 L = cells[i].rgb;
-        float3 d = c.xyz - p;
-        float dd = dot(d, d);
-        float w = c.w / (dd + r2);
-        float3 dir = d / sqrt(dd + 0.25 * r2);
-        whole += w;
-        toward += w * dir;
-        light += w * L;
-        red += w * L.r * dir;
-        green += w * L.g * dir;
-        blue += w * L.b * dir;
+    for (uint base = 0; base < CELLS; base += 64) {
+        g_pos[tid] = cells[CELLS + 1 + base + tid];
+        g_col[tid] = cells[base + tid].rgb;
+        GroupMemoryBarrierWithGroupSync();
+        if (inside) {
+            for (uint j = 0; j < 64; j++) {
+                float4 c = g_pos[j];
+                float3 L = g_col[j];
+                float3 d = c.xyz - p;
+                float dd = dot(d, d);
+                float w = c.w / (dd + r2);
+                float3 dir = d * rsqrt(dd + 0.25 * r2);
+                whole += w;
+                toward += w * dir;
+                light += w * L;
+                red += w * L.r * dir;
+                green += w * L.g * dir;
+                blue += w * L.b * dir;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (!inside) return;
     whole = max(whole, 1e-6);
     light /= whole;
     toward /= whole;
@@ -505,7 +517,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    run(&pass.gather, 20, 12, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }

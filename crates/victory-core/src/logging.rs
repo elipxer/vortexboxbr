@@ -23,6 +23,25 @@ pub fn init(default_level: &str) {
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
         .unwrap_or_else(|| EnvFilter::new(default_level));
+    let file_layer = std::env::var_os("VICTORY_LOG_FILE")
+        .filter(|v| !v.is_empty())
+        .and_then(|path| {
+            let path = std::path::PathBuf::from(path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()
+        })
+        .map(|file| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_target(true)
+                .with_writer(std::sync::Mutex::new(file))
+        });
     let _ = tracing_subscriber::registry()
         .with(CAP)
         .with(filter)
@@ -31,5 +50,6 @@ pub fn init(default_level: &str) {
                 .with_target(true)
                 .with_writer(std::io::stderr),
         )
+        .with(file_layer)
         .try_init();
 }

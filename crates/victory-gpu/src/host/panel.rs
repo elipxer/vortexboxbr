@@ -177,8 +177,11 @@ const COUNTERS: usize = 11;
 impl Counters {
     fn now() -> Counters {
         use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
-        use crate::copystat::{C, peek};
         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let record_ns = crate::copystat::peek(crate::copystat::C::RecordNs);
+        #[cfg(not(feature = "diagnostics"))]
+        let record_ns = 0;
         Counters([
             super::worked(),
             get(&CARD_CLOCK_US[0]),
@@ -189,7 +192,7 @@ impl Counters {
             get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
             crate::draw::dropped_now(),
-            peek(C::RecordNs),
+            record_ns,
             crate::draw::drawn(),
         ])
     }
@@ -205,19 +208,39 @@ impl Counters {
     }
 }
 
+#[cfg(not(feature = "diagnostics"))]
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.WorkingSetSize as u64, c.PagefileUsage as u64)
+}
+
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
 fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    #[cfg(feature = "diagnostics")]
     let (working, private) = crate::copystat::process_memory();
+    #[cfg(not(feature = "diagnostics"))]
+    let (working, private) = process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
+    #[cfg(feature = "diagnostics")]
+    let rec_line = format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3);
+    #[cfg(not(feature = "diagnostics"))]
+    let rec_line = format!("BUILD RELEASE  COPY BACK {:.1}", c[5] / 1e3);
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
+        rec_line,
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
@@ -363,6 +386,7 @@ impl Panel {
         }
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
