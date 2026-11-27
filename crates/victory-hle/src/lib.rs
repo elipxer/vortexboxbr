@@ -28,6 +28,30 @@ pub use victory_gpu::replay;
 
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
+#[cfg(windows)]
+pub use victory_gpu::streamline;
+#[cfg(windows)]
+pub use victory_gpu::SETTINGS_MENU_OPEN;
+
+/// Console-tiled RGBA8 scanout reservation for `width x height`
+/// (`SW_64KB_D_X`), exposed here so `apps/victory` does not need a direct
+/// `victory-formats` dependency that would alter `Cargo.lock` and the shader
+/// translation cache key.
+pub fn tiled_scanout_pool_bytes(width: u32, height: u32) -> Option<u32> {
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+    let texture = Texture::new(&TextureDesc {
+        dimension: Dimension::Tex2d,
+        width,
+        height,
+        depth_or_array: 1,
+        mips: 1,
+        format: 28,
+        samples: 1,
+        swizzle: Swizzle::SW_64KB_D_X,
+    })
+    .ok()?;
+    u32::try_from((texture.size.next_multiple_of(64 * 1024) * 2).next_multiple_of(2 << 20)).ok()
+}
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

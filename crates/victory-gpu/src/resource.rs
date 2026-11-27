@@ -121,6 +121,9 @@ pub(crate) struct AllocationInfo {
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
+// placed_resource_words copies the two field spans on either side of the padding.
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
@@ -1838,7 +1841,25 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    // The most the targets have held this run: what the room is sized by
+    // (`targets_kept_from_peak`), unless the switch above set it flat.
+    static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let peak = PEAK.fetch_max(targets, Relaxed).max(targets);
+    static FLAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FLAT.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_TARGETS_MB").is_some()) {
+        return most.saturating_sub(targets);
+    }
+    targets_kept_from_peak(most, targets, peak)
+}
+
+/// What [`targets_room_kept`] keeps of `most` without the flat switch: half
+/// as much again as the targets have held at their most (`peak`), and at
+/// least 256 MiB, never more than `most` (PR #76).
+#[cfg(any(windows, test))]
+fn targets_kept_from_peak(most: u64, targets: u64, peak: u64) -> u64 {
+    /// Room for targets to grow into while they are still being made.
+    const LEAST: u64 = 256 << 20;
+    peak.saturating_add(peak / 2).max(LEAST).min(most).saturating_sub(targets)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2482,6 +2503,14 @@ pub(crate) fn host_resource<'a>(
     // list and no slot holds and that nothing asked for in seconds (the
     // asking just made is noted under the same lock).
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+}
+
+/// Whether `this` is a valid title resource created by this runtime.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0; size_of::<usize>()];
+    crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
 /// A title texture's host copy, shared, for a list to hold.

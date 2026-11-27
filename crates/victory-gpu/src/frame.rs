@@ -25,6 +25,42 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+/// `VICTORY_FRAME_INTERVAL_MS`: the interval asked for in place of the
+/// title's (zero: no wait). Read once.
+fn asked() -> Option<Duration> {
+    static ASKED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
+        let ms = parse_ms(&spec);
+        match ms {
+            Some(d) => tracing::info!(interval = ?d, "frame interval of ours in place of the title's (VICTORY_FRAME_INTERVAL_MS)"),
+            None => tracing::warn!(spec, "VICTORY_FRAME_INTERVAL_MS: expected milliseconds from 0 to 1000; the title's interval kept"),
+        }
+        ms
+    })
+}
+
+fn parse_ms(spec: &str) -> Option<Duration> {
+    let ms = spec.trim().parse::<f64>().ok().filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))?;
+    Some(Duration::from_nanos((ms * 1e6).round() as u64))
+}
+
+/// `VICTORY_FRAME_INTERVAL_US=<n>`: frames begin every `n` microseconds
+/// whatever interval the title sets (16667: 60 a second, 8333: 120, 1000:
+/// uncapped). Values outside 1,000..=1,000,000 are ignored.
+fn interval_override() -> Option<Duration> {
+    static OVERRIDE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let us = std::env::var("VICTORY_FRAME_INTERVAL_US").ok()?.trim().parse::<u64>().ok()?;
+        let interval = (1_000..=1_000_000).contains(&us).then(|| Duration::from_micros(us));
+        match interval {
+            Some(interval) => tracing::info!(?interval, "VICTORY_FRAME_INTERVAL_US: frame interval overridden"),
+            None => tracing::warn!(us, "VICTORY_FRAME_INTERVAL_US outside 1000..=1000000: ignored"),
+        }
+        interval
+    })
+}
+
 struct Clock {
     start: Instant,
     interval: Duration,
@@ -46,14 +82,15 @@ pub(crate) extern "system" fn set_interval(
     _: This,
     _output: This,
     length: u32,
-    _period: u32,
-    _flags: u32,
+    period: u32,
+    flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked_by_title = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = asked().or_else(interval_override).unwrap_or(asked_by_title);
+    tracing::info!(?interval, title = ?asked_by_title, period, flags, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -105,9 +142,13 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        interval: asked().or_else(interval_override).unwrap_or(SIXTIETH),
         first: 0,
     });
+    if c.interval.is_zero() {
+        let tick = last(kind).load(Ordering::Relaxed) + 1;
+        return (tick, Duration::ZERO);
+    }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =

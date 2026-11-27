@@ -217,6 +217,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            // (The submitting thread waits for its rounds.)
+            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
             struct Over;
@@ -245,6 +247,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
+                priority.keep();
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
@@ -627,53 +630,56 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that host heap instance (`id`) still exists.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
-/// Gives back a batch of `(heap, first, n)` dynamic ranges, acquiring
-/// `SHADER_HEAPS` once and each host heap's allocator lock once per heap.
+/// Gives back a batch of `(heap, host_id, first, n)` dynamic ranges, acquiring
+/// `SHADER_HEAPS` once and each matching host heap's allocator lock once per heap.
 #[cfg(windows)]
-pub(crate) fn release_dynamic_many(ranges: &[(usize, u32, u32)]) {
+pub(crate) fn release_dynamic_many(ranges: &[(usize, u64, u32, u32)]) {
     if ranges.is_empty() {
         return;
     }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    // Common case: every dynamic allocation in a list belongs to one view heap.
-    let first_heap = ranges[0].0;
-    if ranges.iter().all(|&(h, _, _)| h == first_heap) {
+    // Common case: every dynamic allocation in a list belongs to one view heap instance.
+    let (first_heap, first_id) = (ranges[0].0, ranges[0].1);
+    if ranges.iter().all(|&(h, id, _, _)| h == first_heap && id == first_id) {
         if heaps.iter().any(|&(_, _, h)| h == first_heap)
             // SAFETY: registered heaps are live (removed when dropped).
             && let Some(Some(host)) = unsafe { &*(first_heap as *const Heap) }.host.get()
+            && host.id() == first_id
         {
             let mut batch: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
-            batch.extend(ranges.iter().map(|&(_, first, n)| (first, n)));
-            host.release_many(&batch);
+            batch.extend(ranges.iter().map(|&(_, _, first, n)| (first, n)));
+            host.release_many(first_id, &batch);
         }
         return;
     }
-    let mut by_heap: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
-    for &(heap, first, n) in ranges {
-        if let Some((_, list)) = by_heap.iter_mut().find(|(h, _)| *h == heap) {
+    let mut by_heap: Vec<((usize, u64), Vec<(u32, u32)>)> = Vec::new();
+    for &(heap, id, first, n) in ranges {
+        if let Some((_, list)) = by_heap.iter_mut().find(|(k, _)| *k == (heap, id)) {
             list.push((first, n));
         } else {
-            by_heap.push((heap, vec![(first, n)]));
+            by_heap.push(((heap, id), vec![(first, n)]));
         }
     }
-    for (heap, batch) in by_heap {
+    for ((heap, id), batch) in by_heap {
         if heaps.iter().any(|&(_, _, h)| h == heap)
             // SAFETY: registered heaps are live (removed when dropped).
             && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+            && host.id() == id
         {
-            host.release_many(&batch);
+            host.release_many(id, &batch);
         }
     }
 }
@@ -697,6 +703,7 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
 /// `heap`, if that heap still exists, the constant buffer view of `size`
 /// bytes of `buffer` at `gpu`.
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn constant_slot(
     heap: usize,
     index: u32,
@@ -710,6 +717,35 @@ pub(crate) fn constant_slot(
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.constant_at(index, buffer, gpu, size);
+    }
+}
+
+/// Batched version of [`constant_slot`]: acquires `SHADER_HEAPS` once for an
+/// entire worker bucket of `(heap, index, gpu, size)` slots (`card_steps`).
+#[cfg(windows)]
+pub(crate) fn constant_slots_batch(
+    slots: &[(usize, u32, u64, u32)],
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    if slots.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut cached_heap: usize = 0;
+    let mut cached_host: Option<&host::HostHeap> = None;
+    for &(heap, index, gpu, size) in slots {
+        if heap != cached_heap {
+            cached_heap = heap;
+            cached_host = if heaps.iter().any(|&(_, _, h)| h == heap) {
+                // SAFETY: registered heaps are live while `SHADER_HEAPS` read lock is held.
+                unsafe { &*(heap as *const Heap) }.host.get().and_then(Option::as_ref)
+            } else {
+                None
+            };
+        }
+        if let Some(host) = cached_host {
+            host.constant_at(index, buffer, gpu, size);
+        }
     }
 }
 
@@ -905,6 +941,11 @@ struct Views {
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
     shape_index: std::collections::BTreeMap<Shape, u32>,
+    /// Entries of views that no resource releases (constant buffer views
+    /// and views of placed memory that did not fit a record), oldest first,
+    /// with the generation each was made at: past [`ownerless_cap`] the
+    /// oldest is freed, so they cannot grow for the whole run.
+    ownerless: std::collections::VecDeque<(u32, u32)>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
@@ -918,7 +959,21 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     free: Vec::new(),
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
+    ownerless: std::collections::VecDeque::new(),
 });
+
+/// How many table entries of views without a resource are kept
+/// ([`Views::ownerless`]). `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (0: keep
+/// all, without queueing into `ownerless`).
+fn ownerless_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_OWNERLESS_VIEWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1 << 20)
+    })
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -1047,6 +1102,40 @@ impl Views {
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
     fn entry(&mut self, view: View) -> [u32; 2] {
+        self.entry_kept(view, ownerless_cap())
+    }
+
+    /// [`entry`](Self::entry), keeping at most `cap` entries of views
+    /// without a resource (0: all).
+    fn entry_kept(&mut self, view: View, cap: usize) -> [u32; 2] {
+        let ownerless = view.resources() == [0, 0] && matches!(view, View::Constant(..) | View::Placed(..));
+        let fresh = !self.index.contains_key(&view);
+        let words = self.entry_made(view);
+        if cap != 0 && ownerless && fresh {
+            self.ownerless.push_back((words[0], words[1]));
+            while self.ownerless.len() > cap {
+                let (i, generation) = self.ownerless.pop_front().expect("longer than cap");
+                self.free_ownerless(i, generation);
+            }
+        }
+        words
+    }
+
+    /// Frees entry `i` if it still holds the view it had at `generation`
+    /// (it may have been freed and made again for another view since).
+    fn free_ownerless(&mut self, i: u32, generation: u32) {
+        let Some((view, current)) = self.list.get(i as usize).cloned() else {
+            return;
+        };
+        if current != generation || self.index.get(&view) != Some(&i) {
+            return;
+        }
+        self.index.remove(&view);
+        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        self.free.push(i);
+    }
+
+    fn entry_made(&mut self, view: View) -> [u32; 2] {
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
@@ -1463,6 +1552,61 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Copy only the initialized fields of a placed resource description. Padding
+/// (words 1 and 13) can differ between two views of the same texture.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    let mut fields = [0; 14];
+    // SAFETY: the caller supplies a 56-byte ResourceDesc, possibly unaligned.
+    // Dimension occupies word 0. Alignment through Flags occupy words 2..13.
+    unsafe {
+        fields[0] = src.read_unaligned();
+        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
+    }
+    Some(fields)
+}
+
+/// The words of a placed view's description with those its kind does not
+/// use set to zero (PR #58). Prevents unwritten stack/union padding from
+/// exploding the placed-view shape table.
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    // SAFETY: caller supplies a 16-word placed view description; format and
+    // dimension live in words 0..2, address and console fields in 10..16.
+    let (format, dim) = unsafe { (src.read_unaligned(), src.add(1).read_unaligned()) };
+    let (start, used) = if unordered {
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2usize, USED.get(dim as usize).copied())
+    } else {
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4usize, USED.get(dim as usize).copied())
+    };
+    let mut d = [0u32; 16];
+    if let Some(used) = used.filter(|_| dim != 0) {
+        d[0] = format;
+        d[1] = dim;
+        // SAFETY: only initialized prefix words, used union words, and tail 10..16 are read.
+        unsafe {
+            if !unordered {
+                d[2] = src.add(2).read_unaligned();
+            }
+            for i in 0..used {
+                d[start + i] = src.add(start + i).read_unaligned();
+            }
+            d[10..16].copy_from_slice(&src.add(10).cast::<[u32; 6]>().read_unaligned());
+        }
+    } else {
+        d = words(desc)?;
+    }
+    Some(d)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1472,7 +1616,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1483,7 +1627,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1789,7 +1933,7 @@ mod tests {
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
         let next = host_heap.dynamic(1).expect("a dynamic slot");
-        host_heap.release(next, 1);
+        host_heap.release(host_heap.id(), next, 1);
         drop(state);
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         assert_eq!(
@@ -1944,8 +2088,9 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // A resource description and a view no other test uses; words 1 and
+        // 13 are the description's padding, which placed views keep as zero.
+        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
@@ -2087,6 +2232,7 @@ mod tests {
             free,
             shapes: Vec::new(),
             shape_index: Default::default(),
+            ownerless: std::collections::VecDeque::new(),
         };
         let (summary, by_kind) = kept(&views);
         let each = size_of::<(View, u32)>() as u64;
@@ -2109,6 +2255,47 @@ mod tests {
         assert_eq!(summary[1], views.free.len() as u64);
         assert_eq!(summary[3], by_kind[KIND_CONSTANT][0] + by_kind[KIND_CONSTANT][1], "constants");
         assert_eq!(summary[4], by_kind[KIND_PLACED][0] + by_kind[KIND_PLACED][1], "placed");
+    }
+
+    #[test]
+    fn placed_views_ignore_unused_padding_and_cap_ownerless() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        let mut resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
+        let expected_res = resource;
+        let mut tex = [28, 4, 0x1688, 0x77, 0, 1, 0, 0, 0x55, 0x66, 0x2000, 0x6, 0, 0, 0, 0];
+        create_placed_srv(null, &expected_res, &tex, handle);
+        let first = slot;
+        resource[1] = 0xaaaa_aaaa;
+        resource[13] = 0xbbbb_bbbb;
+        create_placed_srv(null, &resource, &tex, handle);
+        assert_eq!(slot, first);
+        tex[3] = 0;
+        (tex[8], tex[9]) = (0, 0);
+        assert_eq!(view(handle), Some(View::Placed(false, expected_res, tex)));
+
+        let mut views = Views {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            by_resource: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            shapes: Vec::new(),
+            shape_index: std::collections::BTreeMap::new(),
+            ownerless: std::collections::VecDeque::new(),
+        };
+        let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
+        for n in 0..10 {
+            views.entry_kept(placed(n), 4);
+        }
+        assert_eq!(views.index.len(), 4);
+        // cap=0 disables eviction AND must not push to ownerless queue.
+        let before_q = views.ownerless.len();
+        for n in 10..20 {
+            views.entry_kept(placed(n), 0);
+        }
+        assert_eq!(views.ownerless.len(), before_q);
+        assert_eq!(views.index.len(), 14);
     }
 
     /// A second, isolated fixture (its own `Views`, no shared state),
@@ -2141,6 +2328,7 @@ mod tests {
             free: Vec::new(),
             shapes: Vec::new(),
             shape_index: Default::default(),
+            ownerless: std::collections::VecDeque::new(),
         };
         let (_, before_kind) = kept(&before);
         for (k, name) in [

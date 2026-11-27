@@ -514,22 +514,44 @@ fn parse_skip_hashes(value: &str) -> std::collections::HashSet<u64> {
         .collect()
 }
 
+/// Water tiled volumetric lighting shaders (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`): on 32-lane wave hosts (NVIDIA) they translate wave-wide,
+/// leave dark blocks on open water, and cost ~15-30 ms of GPU per frame (upstream 35c1560).
+/// Left out by default on wave32; set `VICTORY_WATER_LIGHT=1` to run them.
+#[cfg(windows)]
+const WATER_LIGHT_HASHES: [u64; 2] = [0x5dc3_b259_8662_2949, 0x6f22_5b64_1c5b_0708];
+
 #[cfg(windows)]
 fn skip_hashes() -> &'static std::collections::HashSet<u64> {
     static HASHES: OnceLock<std::collections::HashSet<u64>> = OnceLock::new();
     HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let mut set = parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default());
+        // Also accept upstream `VICTORY_LEAVE_OUT` (e.g. decal defrag + heat-haze).
+        if let Ok(leave_out) = std::env::var("VICTORY_LEAVE_OUT") {
+            set.extend(parse_skip_hashes(&leave_out));
+        }
+        set
     })
 }
 
 #[cfg(windows)]
+fn water_light_left_out() -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
+        && victory_shader::emit::host_settings()[0] == 32
+}
+
+#[cfg(windows)]
 fn find_skipped_shader(shaders: &[Arc<Shader>], hashes: &std::collections::HashSet<u64>) -> Option<usize> {
-    if hashes.is_empty() {
+    let skip_water = water_light_left_out();
+    if hashes.is_empty() && !skip_water {
         return None;
     }
     shaders.iter().position(|shader| {
-        u64::from_str_radix(&shader.hash, 16).is_ok_and(|parsed| hashes.contains(&parsed))
+        u64::from_str_radix(&shader.hash, 16).is_ok_and(|parsed| {
+            hashes.contains(&parsed)
+                || (skip_water && shader.stage == "compute" && WATER_LIGHT_HASHES.contains(&parsed))
+        })
     })
 }
 

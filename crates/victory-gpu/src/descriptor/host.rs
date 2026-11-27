@@ -111,7 +111,13 @@ impl Made {
     }
 }
 
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// Identity of this host heap instance, checked by [`release`] and
+    /// [`release_many`] so a stale list resetting after a title heap was
+    /// replaced at the same address cannot free slots belonging to a new heap.
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1573,6 +1579,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -2597,17 +2604,24 @@ impl HostHeap {
         stale
     }
 
-    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
-    ///
-    /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
-        self.release_many(&[(first, n)]);
+    /// Identity of this host heap instance (see [`release`] / [`release_many`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
-    /// Gives back multiple dynamic ranges under a single allocator lock.
-    pub(crate) fn release_many(&self, ranges: &[(u32, u32)]) {
-        if ranges.is_empty() {
+    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
+    /// returned), only if `id` matches this host heap.
+    ///
+    /// [`dynamic`]: HostHeap::dynamic
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        self.release_many(id, &[(first, n)]);
+    }
+
+    /// Gives back multiple dynamic ranges under a single allocator lock, only
+    /// if `id` matches this host heap.
+    pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)]) {
+        if id != self.id || ranges.is_empty() {
             return;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -2766,22 +2780,114 @@ impl HostHeap {
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+}
 
+/// Bound dynamic raw views to their host buffer. Set `VICTORY_RAW_VIEW_CLAMP=0`
+/// to use the requested range without querying the host width (PR #24).
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
+
+/// FirstElement is a 64-bit dword index. Only NumElements can be shortened.
+#[derive(Clone, Copy)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+/// Why a request lost part of its range, for the counters below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    Past,
+    Length,
+    Short,
+    Unaligned,
+}
+
+fn raw_range(size: u64, offset: u64, len: u64, writable: bool) -> (Option<RawRange>, Option<Cut>) {
+    let words = size / 4;
+    if !offset.is_multiple_of(16) {
+        return (None, Some(Cut::Unaligned));
+    }
+    let asked = offset / 4;
+    if asked >= words {
+        return (None, Some(Cut::Past));
+    }
+    let avail = words - asked;
+    // A writable raw UAV must not widen a sub-dword logical request into a
+    // full writable dword that could overwrite neighboring bytes.
+    if writable && len < 4 {
+        return (None, Some(Cut::Short));
+    }
+    let want = (len / 4).max(1);
+    let elements = want.min(avail).min(u64::from(u32::MAX));
+    let cut = if elements < want {
+        Some(Cut::Length)
+    } else if len < 4 {
+        Some(Cut::Short)
+    } else {
+        None
+    };
+    (
+        Some(RawRange {
+            first: asked,
+            elements: elements as u32,
+        }),
+        cut,
+    )
+}
+
+// Since launch, in Cut order: past the end, shortened, sub-dword, unaligned.
+static RAW_SRV_CUTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static RAW_UAV_CUTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+pub(crate) fn raw_view_counts() -> [[u64; 4]; 2] {
+    [&RAW_SRV_CUTS, &RAW_UAV_CUTS]
+        .map(|cuts| cuts.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+fn raw_view_range(
+    buffer: &ID3D12Resource,
+    offset: u64,
+    len: u64,
+    writable: bool,
+    counts: &[std::sync::atomic::AtomicU64; 4],
+) -> Option<RawRange> {
+    if !raw_view_clamp() {
+        return Some(RawRange {
+            first: offset / 4,
+            elements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+        });
+    }
+    // SAFETY: buffer is a live resource.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    let (range, cut) = raw_range(size, offset, len, writable);
+    if let Some(cut) = cut {
+        counts[cut as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    range
+}
+
+impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
     /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, false, &RAW_SRV_CUTS) else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -2813,14 +2919,17 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, true, &RAW_UAV_CUTS) else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -5913,9 +6022,44 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).unwrap();
+        let after_alloc = a.free.load(std::sync::atomic::Ordering::Relaxed);
+        a.release(b.id(), first, 2);
+        a.release_many(b.id(), &[(first, 2)]);
+        assert_eq!(
+            a.free.load(std::sync::atomic::Ordering::Relaxed),
+            after_alloc,
+            "releasing with another heap's identity must not free slots"
+        );
+        a.release_many(a.id(), &[(first, 2)]);
+        assert_eq!(a.free.load(std::sync::atomic::Ordering::Relaxed), after_alloc + 2);
+    }
+
+    #[test]
+    fn raw_range_stays_inside_buffer_and_guards_short_uav() {
+        let rr = |size, offset, len, writable| {
+            let (r, c) = raw_range(size, offset, len, writable);
+            (r.map(|v| (v.first, v.elements)), c)
+        };
+        assert_eq!(rr(1024, 0, 256, false), (Some((0, 64)), None));
+        assert_eq!(rr(1024, 768, 512, false), (Some((192, 64)), Some(Cut::Length)));
+        assert_eq!(rr(100, 112, 16, false), (None, Some(Cut::Past)));
+        assert_eq!(rr(1024, 3, 16, false), (None, Some(Cut::Unaligned)));
+        assert_eq!(rr(1024, 0, 1, false), (Some((0, 1)), Some(Cut::Short)));
+        assert_eq!(rr(1024, 0, 1, true), (None, Some(Cut::Short)));
+        assert_eq!(rr(1024, 0, 4, true), (Some((0, 1)), None));
+        assert_eq!(rr(1u64 << 40, 0, u64::MAX, false), (Some((0, u32::MAX)), Some(Cut::Length)));
     }
 
     #[test]
@@ -5931,17 +6075,17 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
 }

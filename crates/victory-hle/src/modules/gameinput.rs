@@ -1271,6 +1271,9 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            if victory_gpu::SETTINGS_MENU_OPEN.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
@@ -1320,6 +1323,12 @@ mod host {
             if cursor.is_none() {
                 self.mouse = MouseState::default();
                 return None;
+            }
+            // PR #32: keep sampling `previous_cursor` while F1 menu is open so
+            // closing it never injects a jump, while discarding delta & buttons.
+            if victory_gpu::SETTINGS_MENU_OPEN.load(Ordering::Relaxed) {
+                self.mouse.buttons = 0;
+                return Some(self.mouse);
             }
             self.mouse.position_x += dx;
             self.mouse.position_y += dy;

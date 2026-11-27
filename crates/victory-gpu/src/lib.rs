@@ -34,6 +34,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -76,6 +78,8 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+pub mod streamline;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
@@ -95,6 +99,12 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// While the F1 settings menu is open (`host/menu.rs`), the title's keyboard
+/// and mouse input are suppressed (a gamepad still works).
+#[cfg(windows)]
+pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

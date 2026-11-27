@@ -83,16 +83,22 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
-        // Reclaim any boxed `Upload` allocations still sitting in the unhanded
-        // front tail so abandoning/resetting below `CHUNK` never leaks them.
+        // Reclaim any boxed `Upload` or `External` allocations still sitting in
+        // the unhanded front tail so abandoning/resetting below `CHUNK` never leaks them.
         let mut i = 0;
         while i < self.words.len() {
             let op = self.words[i] & 0xffff;
             let len = (self.words[i] >> 16) as usize;
-            if op == UPLOAD && len >= 1 && i + 1 < self.words.len() {
-                // SAFETY: owned raw `Box<Upload>` created in `allocate_upload`
-                // and never handed over to a worker.
-                let _ = unsafe { Box::from_raw(self.words[i + 1] as *mut Upload) };
+            if len >= 1 && i + 1 < self.words.len() {
+                if op == UPLOAD {
+                    // SAFETY: owned raw `Box<Upload>` created in `allocate_upload`
+                    // and never handed over to a worker.
+                    let _ = unsafe { Box::from_raw(self.words[i + 1] as *mut Upload) };
+                } else if op == EXTERNAL {
+                    // SAFETY: owned raw `Box<super::External>` created in `put_external`
+                    // and never handed over to a worker.
+                    let _ = unsafe { Box::from_raw(self.words[i + 1] as *mut super::External) };
+                }
             }
             i += 1 + len;
         }
@@ -482,6 +488,22 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+/// Work of ours (`super::external`), boxed.
+const EXTERNAL: u64 = after(17);
+
+/// Writes down work of ours at this place of a title list's stream
+/// ([`super::external`]); gives it back if the list is not written down.
+pub(super) fn put_external(this: This, work: super::External) -> Result<(), super::External> {
+    if !wanted() || !on() {
+        return Err(work);
+    }
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return Err(work);
+    }
+    front.put(EXTERNAL, &[Box::into_raw(Box::new(work)) as u64]);
+    Ok(())
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -710,6 +732,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
+            continue;
+        }
+        if op == EXTERNAL {
+            // SAFETY: made by `put_external`, named once.
+            let work = *unsafe { Box::from_raw(w[0] as *mut super::External) };
+            if !skip {
+                super::run_external(list, work);
+            }
             continue;
         }
         if skip && op != CLOSE && op != RESET {

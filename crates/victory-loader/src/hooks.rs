@@ -162,6 +162,15 @@ fn parse_scale(text: &str) -> Option<f32> {
 /// # Safety
 /// As `disarm_watchdog`.
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
+    // When DLSS, FSR 3 frame generation, or explicit FidelityFX path owns the
+    // prepared image's upscaler & render scale (`native_1440p::prepare_upscaler`),
+    // never overwrite renderer selection or scale constants at map time.
+    let upscaler_owned = ["VICTORY_DLSS", "VICTORY_FRAMEGEN", "VICTORY_FSR_FRAMEGEN", "VICTORY_FSR_PATH"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| v.trim() == "1"));
+    if upscaler_owned {
+        return 0;
+    }
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
     if scale.is_none() && !own {

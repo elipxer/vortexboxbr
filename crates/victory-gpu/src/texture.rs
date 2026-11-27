@@ -17,6 +17,21 @@
 
 pub(crate) mod ahead;
 
+/// Bound the number of refreshes sharing a mapping read guard (`VICTORY_REFRESH_BATCH=1`).
+pub(crate) fn refresh_group_size() -> usize {
+    static SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("VICTORY_REFRESH_BATCH").is_some_and(|v| v == "1") { 8 } else { 1 }
+    });
+    *SIZE
+}
+
+pub(crate) fn refresh_group<'a>(textures: impl IntoIterator<Item = &'a Arc<Staging>>) {
+    let mut mapping = None;
+    for texture in textures {
+        texture.refresh_in(&mut mapping);
+    }
+}
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -1182,31 +1197,49 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
+        self.refresh_in(&mut None);
+    }
+
+    fn refresh_in(&self, mapping: &mut Option<crate::watch::Reading>) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
-        let read = self.refresh_now();
+        let read = self.refresh_now(mapping);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, mapping: &mut Option<crate::watch::Reading>) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(mapping);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, mapping: &mut Option<crate::watch::Reading>) -> usize {
         let size = self.read;
         let start = self.memory as usize;
-        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut last = waited(0, || {
+            if mapping.is_some() {
+                match self.last.try_lock() {
+                    Ok(last) => return last,
+                    Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                    // Release our mapping guard before blocking on another texture's lock.
+                    Err(std::sync::TryLockError::WouldBlock) => *mapping = None,
+                }
+            }
+            self.last.lock().unwrap_or_else(|e| e.into_inner())
+        });
         let last = &mut *last;
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
         if alone && last.hash.is_some() {
             return 0;
+        }
+        // Never hold `MAPPING` read guard across write-watch/guard acquisition.
+        if !alone && mapping.is_some() {
+            *mapping = None;
         }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
@@ -1273,17 +1306,44 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
-        };
+        // Opt-in lockless speculative read (`VICTORY_REFRESH_LOCKLESS=1`, PR #59):
+        // avoids taking `MAPPING` when no remap occurred around a complete read.
+        // On-demand streamed textures still take the guarded path to rejudge mips.
+        static LOCKLESS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_REFRESH_LOCKLESS").is_some_and(|v| v == "1")
+        });
+        if *LOCKLESS && !self.on_demand && mapping.is_none() {
+            let epoch = crate::watch::changes();
+            if epoch.is_multiple_of(2)
+                && with_read(size, |bytes| {
+                    if !crate::host::read_into(self.memory, bytes) || epoch != crate::watch::changes() {
+                        return false;
+                    }
+                    let hash = digest(bytes);
+                    if last.hash != Some(hash) {
+                        last.hash = Some(hash);
+                        found_blind(last);
+                        self.detile(bytes);
+                    }
+                    true
+                })
+            {
+                return size;
+            }
+        }
+        if mapping.is_none() {
+            *mapping = Some(if no_wait() {
+                // Not waited for: while the runtime remaps title memory the
+                // texture is read through the kernel instead, whole or not at
+                // all (`no_wait`).
+                let Some(mapped) = crate::watch::title_memory_reading_now() else {
+                    return self.refresh_unlocked(last, size);
+                };
+                mapped
+            } else {
+                waited(2, crate::watch::title_memory_reading)
+            });
+        }
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
