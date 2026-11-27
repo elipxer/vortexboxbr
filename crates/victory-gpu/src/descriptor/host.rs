@@ -1529,7 +1529,7 @@ enum Cut {
     Unaligned,
 }
 
-fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>) {
+fn raw_range(size: u64, offset: u64, len: u64, writable: bool) -> (Option<RawRange>, Option<Cut>) {
     let words = size / 4;
     if !offset.is_multiple_of(16) {
         return (None, Some(Cut::Unaligned));
@@ -1539,9 +1539,13 @@ fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>
         return (None, Some(Cut::Past));
     }
     let avail = words - asked;
-    // A length under a dword made one element before this guard. The floor is
-    // kept because nothing was gathered about why the title would ask for less
-    // than a dword; the buffer's end still caps it.
+    // A writable raw UAV must not widen a sub-dword logical request into a
+    // full writable dword that could overwrite neighboring bytes.
+    if writable && len < 4 {
+        return (None, Some(Cut::Short));
+    }
+    // A read-only length under a dword made one element before this guard;
+    // the buffer's end still caps it.
     let want = (len / 4).max(1);
     let elements = want.min(avail).min(u64::from(u32::MAX));
     let cut = if elements < want {
@@ -1572,6 +1576,7 @@ fn raw_view_range(
     buffer: &ID3D12Resource,
     offset: u64,
     len: u64,
+    writable: bool,
     counts: &[AtomicU64; 4],
 ) -> Option<RawRange> {
     if !raw_view_clamp() {
@@ -1582,7 +1587,7 @@ fn raw_view_range(
     }
     // SAFETY: buffer is a live resource.
     let size = unsafe { buffer.GetDesc() }.Width;
-    let (range, cut) = raw_range(size, offset, len);
+    let (range, cut) = raw_range(size, offset, len, writable);
     if let Some(cut) = cut {
         counts[cut as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -3426,20 +3431,32 @@ impl HostHeap {
     /// returned), only if `id` matches this host heap.
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
-        if id != self.id {
+        self.release_many(id, &[(first, n)]);
+    }
+
+    /// Gives back multiple dynamic ranges under a single allocator lock, only
+    /// if `id` matches this host heap.
+    pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)]) {
+        if id != self.id || ranges.is_empty() {
             return;
         }
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+        let mut total_given = 0u32;
+        for &(first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = at.saturating_add(n).min(self.dynamic) as usize;
+            if let Some(slots) = guard.1.get_mut(at as usize..end) {
+                total_given += slots.iter().filter(|taken| **taken).count() as u32;
+                slots.fill(false);
+            }
+        }
+        if total_given > 0 {
+            self.free.fetch_add(total_given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -3592,7 +3609,7 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let Some(range) = raw_view_range(buffer, offset, len, &RAW_SRV_CUTS) else {
+        let Some(range) = raw_view_range(buffer, offset, len, false, &RAW_SRV_CUTS) else {
             self.null_raw_at(index);
             return;
         };
@@ -3637,7 +3654,7 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let Some(range) = raw_view_range(buffer, offset, len, &RAW_UAV_CUTS) else {
+        let Some(range) = raw_view_range(buffer, offset, len, true, &RAW_UAV_CUTS) else {
             self.null_raw_uav_at(index);
             return;
         };
@@ -5606,7 +5623,12 @@ mod tests {
     use super::*;
 
     fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
-        let (range, cut) = raw_range(size, offset, len);
+        let (range, cut) = raw_range(size, offset, len, false);
+        (range.map(|v| (v.first, v.elements)), cut)
+    }
+
+    fn rrw(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
+        let (range, cut) = raw_range(size, offset, len, true);
         (range.map(|v| (v.first, v.elements)), cut)
     }
 
@@ -5641,6 +5663,9 @@ mod tests {
         assert_eq!(rr(100, 112, 16), (None, Some(Cut::Past)));
         assert_eq!(rr(1024, 3, 16), (None, Some(Cut::Unaligned)));
         assert_eq!(rr(1024, 0, 0), (Some((0, 1)), Some(Cut::Short)));
+        assert_eq!(rrw(1024, 0, 0), (None, Some(Cut::Short)), "writable UAV refuses sub-dword widening");
+        assert_eq!(rrw(1024, 0, 3), (None, Some(Cut::Short)), "writable UAV refuses sub-dword widening");
+        assert_eq!(rrw(1024, 0, 4), (Some((0, 1)), None));
         assert_eq!(rr(1024, 768, 512), (Some((192, 64)), Some(Cut::Length)));
         // Nothing cut, nothing refused: no counter is touched at all.
         assert_eq!(rr(1024, 0, 256), (Some((0, 64)), None));
@@ -5687,7 +5712,7 @@ mod tests {
         for size in sizes {
             for offset in offsets {
                 for len in lens {
-                    let (range, _) = raw_range(size, offset, len);
+                    let (range, _) = raw_range(size, offset, len, false);
                     let aligned = offset.is_multiple_of(16);
                     let inside = offset / 4 < size / 4;
                     match range {

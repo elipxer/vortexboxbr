@@ -83,6 +83,25 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
+        // Reclaim any boxed `Upload` or `External` allocations still sitting in
+        // the unhanded front tail so abandoning/resetting below `CHUNK` never leaks them.
+        let mut i = 0;
+        while i < self.words.len() {
+            let op = self.words[i] & 0xffff;
+            let len = (self.words[i] >> 16) as usize;
+            if len >= 1 && i + 1 < self.words.len() {
+                if op == UPLOAD {
+                    // SAFETY: owned raw `Box<Upload>` created in `allocate_upload`
+                    // and never handed over to a worker.
+                    let _ = unsafe { Box::from_raw(self.words[i + 1] as *mut Upload) };
+                } else if op == EXTERNAL {
+                    // SAFETY: owned raw `Box<super::External>` created in `put_external`
+                    // and never handed over to a worker.
+                    let _ = unsafe { Box::from_raw(self.words[i + 1] as *mut super::External) };
+                }
+            }
+            i += 1 + len;
+        }
         self.words.clear();
     }
 

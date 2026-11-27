@@ -208,11 +208,18 @@ fn shade() -> [f32; 2] {
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#ifdef HALF_GRID
+#define CX 32
+#define CY 18
+#define PX 80
+#define PY 45
+#else
 #define CX 64
 #define CY 36
-#define CELLS (CX * CY)
 #define PX 160
 #define PY 90
+#endif
+#define CELLS (CX * CY)
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
@@ -241,6 +248,7 @@ RWTexture2D<float3> radiance : register(u0);
 [RootSignature(RS)]
 [numthreads(8, 4, 1)]
 void keep(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= CX || at.y >= CY) return;
     uint w, h;
     radiance.GetDimensions(w, h);
     float3 sum = 0;
@@ -271,6 +279,7 @@ void mean() {
 [RootSignature(RS)]
 [numthreads(8, 4, 1)]
 void place(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= CX || at.y >= CY || cells[CELLS].a <= 0.0) return;
     float2 size = float2(width, height);
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
     cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
@@ -278,28 +287,43 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
+groupshared float4 g_pos[64];
+groupshared float3 g_col[64];
 [RootSignature(RS)]
-[numthreads(8, 2, 1)]
-void gather(uint3 at : SV_DispatchThreadID) {
+[numthreads(8, 8, 1)]
+void gather(uint3 at : SV_DispatchThreadID, uint tid : SV_GroupIndex) {
+    // Keep GroupMemoryBarrierWithGroupSync in uniform control flow for FXC;
+    // `cells[CELLS].a` is zero-initialized and set to 1.0 by `mean()` in GPU
+    // execution order, so `!active` skips all work and writes until ready.
+    bool active = at.x < PX && at.y < PY && cells[CELLS].a > 0.0;
     float2 size = float2(width, height);
-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+    float3 p = active ? seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size) : 0.0;
     float r2 = 0.25 + 0.0025 * p.z * p.z;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    for (uint i = 0; i < CELLS; i++) {
-        float4 c = cells[CELLS + 1 + i];
-        float3 L = cells[i].rgb;
-        float3 d = c.xyz - p;
-        float dd = dot(d, d);
-        float w = c.w / (dd + r2);
-        float3 dir = d / sqrt(dd + 0.25 * r2);
-        whole += w;
-        toward += w * dir;
-        light += w * L;
-        red += w * L.r * dir;
-        green += w * L.g * dir;
-        blue += w * L.b * dir;
+    for (uint base = 0; base < CELLS; base += 64) {
+        g_pos[tid] = cells[CELLS + 1 + base + tid];
+        g_col[tid] = cells[base + tid].rgb;
+        GroupMemoryBarrierWithGroupSync();
+        if (active) {
+            for (uint j = 0; j < 64; j++) {
+                float4 c = g_pos[j];
+                float3 L = g_col[j];
+                float3 d = c.xyz - p;
+                float dd = dot(d, d);
+                float w = c.w / (dd + r2);
+                float3 dir = d * rsqrt(dd + 0.25 * r2);
+                whole += w;
+                toward += w * dir;
+                light += w * L;
+                red += w * L.r * dir;
+                green += w * L.g * dir;
+                blue += w * L.b * dir;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (!active) return;
     whole = max(whole, 1e-6);
     light /= whole;
     toward /= whole;
@@ -318,6 +342,7 @@ RWTexture3D<float3> scattered : register(u0);
 [RootSignature(RS)]
 [numthreads(8, 8, 2)]
 void clear_air(uint3 at : SV_DispatchThreadID) {
+    if (cells[CELLS].a <= 0.0) return;
     uint w, h, d;
     scattered.GetDimensions(w, h, d);
     if (at.x >= w || at.y >= h || at.z >= d) return;
@@ -327,6 +352,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    if (any(isnan(c)) || any(isinf(c))) { scattered[at] = 0; return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
@@ -341,6 +367,7 @@ RWTexture2D<float3> reflected : register(u0);
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void reflect_light(uint3 at : SV_DispatchThreadID) {
+    if (cells[CELLS].a <= 0.0) return;
     uint w, h;
     reflected.GetDimensions(w, h);
     if (at.x >= w || at.y >= h) return;
@@ -405,6 +432,7 @@ uint pack(float3 c) {
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
+    if (constant <= 0.0 && cells[CELLS].a <= 0.0) return;
     float2 size = float2(width, height);
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
@@ -493,10 +521,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
 #endif
 "#;
 
-/// Bytes of the cells' buffer and of the points'.
-const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1 + 25 * CELLS) * 16;
-const POINT_BYTES: u64 = 160 * 90 * 48;
+/// Optional half-resolution probe grid (`VICTORY_AMBIENT_HALF=1`): uses 32x18
+/// cells and 80x45 points (16x fewer gather evaluations) while preserving the
+/// 25-share cell layout and specular reflection estimate.
+fn half_grid() -> bool {
+    static HALF: OnceLock<bool> = OnceLock::new();
+    *HALF.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_HALF").is_some_and(|v| v == "1"))
+}
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -509,16 +540,25 @@ struct Pass {
     reflect: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
+    cx: u32,
+    cy: u32,
+    px: u32,
+    py: u32,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
+fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>, half: bool) -> windows::core::Result<Pass> {
+    let (cx, cy, px, py) = if half { (32u32, 18u32, 80u32, 45u32) } else { (64, 36, 160, 90) };
+    let cells_count = u64::from(cx) * u64::from(cy);
+    let cell_bytes = (2 * cells_count + 1 + 25 * cells_count) * 16;
+    let point_bytes = u64::from(px) * u64::from(py) * 48;
+    let prefix = if half { "#define HALF_GRID\n" } else { "" };
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = crate::host::compile(&format!("{prefix}#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
@@ -549,8 +589,12 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         reflect,
-        cells: made(CELL_BYTES)?,
-        points: made(POINT_BYTES)?,
+        cells: made(cell_bytes)?,
+        points: made(point_bytes)?,
+        cx,
+        cy,
+        px,
+        py,
     })
 }
 
@@ -558,7 +602,7 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes))
+        make(&host.device, |bytes| host.uav_buffer(bytes), half_grid())
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
     })
@@ -744,23 +788,23 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         };
         match role {
             Role::Radiance => {
-                run(&pass.keep, 8, 9, 1);
+                run(&pass.keep, pass.cx.div_ceil(8), pass.cy.div_ceil(4), 1);
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
-                    run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    run(&pass.place, pass.cx.div_ceil(8), pass.cy.div_ceil(4), 1);
+                    run(&pass.gather, pass.px.div_ceil(8), pass.py.div_ceil(8), 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
             Role::Miss => {
                 // The points afresh, from this frame's depth: the diffuse
                 // stand-in makes them later in the frame.
-                run(&pass.place, 8, 9, 1);
-                run(&pass.gather, 20, 45, 1);
+                run(&pass.place, pass.cx.div_ceil(8), pass.cy.div_ceil(4), 1);
+                run(&pass.gather, pass.px.div_ceil(8), pass.py.div_ceil(8), 1);
                 run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
@@ -856,6 +900,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        make(&host.device, |bytes| host.uav_buffer(bytes), false).expect("full grid passes");
+        make(&host.device, |bytes| host.uav_buffer(bytes), true).expect("half grid passes");
     }
 }

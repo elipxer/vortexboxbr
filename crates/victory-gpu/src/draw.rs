@@ -564,9 +564,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, id, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, id, first, n);
-        }
+        crate::descriptor::release_dynamic_many(&self.dynamic);
     }
 }
 
@@ -586,9 +584,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, id, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, id, first, n);
-        }
+        crate::descriptor::release_dynamic_many(&self.dynamic);
+        self.dynamic.clear();
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -723,13 +720,19 @@ struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    pass: BufferPass<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self {
+            passes: 0,
+            ranges: HeapRanges(Vec::new()),
+            pass: BufferPass::default(),
+            unwatched: Default::default(),
+        }
     }
 }
 
@@ -747,8 +750,17 @@ impl<T> HeapRanges<T> {
 
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn forget_part(&mut self, part: u32, parts: u32) {
-        self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
+        self.forget_part_with(part, parts, |_| {});
+    }
+
+    fn forget_part_with(&mut self, part: u32, parts: u32, mut on_forget: impl FnMut(u32)) {
+        for (slot, entry) in self.0.iter_mut().enumerate().skip(part as usize).step_by(parts as usize) {
+            if entry.take().is_some() {
+                on_forget(slot as u32);
+            }
+        }
     }
 
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
@@ -756,9 +768,108 @@ impl<T> HeapRanges<T> {
     }
 }
 
+/// Whether `heap_buffer_pass` maintains per-buffer `(min_from, max_to)` spans
+/// incrementally instead of rescanning every tracked heap slot each frame
+/// (`VICTORY_DESCRIPTOR_BUFFER_SPANS=1`, ported from `stellarr-studio/kelvaroq`
+/// `0055-descriptors.patch`, commit `f3c070cc`, GPL-3.0-or-later).
+fn incremental_buffer_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_BUFFER_SPANS").is_some_and(|v| v == "1"))
+}
+
+/// A copy can appear in thousands of slots. Keep its two outer bounds
+/// current when a slot moves or disappears, so a frame visits one span per
+/// backing buffer even when every descriptor in that buffer stayed put.
+struct BufferSpan<T> {
+    copy: T,
+    starts: std::collections::BTreeSet<(u64, u32)>,
+    ends: std::collections::BTreeSet<(u64, u32)>,
+}
+
+struct BufferPass<T> {
+    slots: std::collections::HashMap<u32, (u64, u64, u64)>,
+    copies: std::collections::HashMap<u64, BufferSpan<T>>,
+}
+
+impl<T> Default for BufferPass<T> {
+    fn default() -> Self {
+        Self {
+            slots: std::collections::HashMap::new(),
+            copies: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<T: Clone> BufferPass<T> {
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.copies.clear();
+    }
+
+    fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn update(&mut self, slot: u32, new: Option<(u64, T, u64, u64)>) {
+        let bounds = new.as_ref().map(|(id, _, from, to)| (*id, *from, *to));
+        if self.slots.get(&slot).copied() == bounds {
+            return;
+        }
+        if let Some((id, from, to)) = self.slots.remove(&slot) {
+            let span = self.copies.get_mut(&id).unwrap();
+            span.starts.remove(&(from, slot));
+            span.ends.remove(&(to, slot));
+            if span.starts.is_empty() {
+                self.copies.remove(&id);
+            }
+        }
+        if let Some((id, copy, from, to)) = new {
+            let span = self.copies.entry(id).or_insert_with(|| BufferSpan {
+                copy,
+                starts: std::collections::BTreeSet::new(),
+                ends: std::collections::BTreeSet::new(),
+            });
+            span.starts.insert((from, slot));
+            span.ends.insert((to, slot));
+            self.slots.insert(slot, (id, from, to));
+        }
+    }
+
+    fn spans(&self) -> Vec<(T, u64, u64)> {
+        self.copies
+            .values()
+            .map(|s| (s.copy.clone(), s.starts.first().unwrap().0, s.ends.last().unwrap().0))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod heap_range_tests {
-    use super::{HEAP_ROUND, HeapRanges};
+    use super::{BufferPass, HEAP_ROUND, HeapRanges};
+
+    #[test]
+    fn changing_one_slot_updates_both_ends_of_its_copies() {
+        let mut pass = BufferPass::default();
+        pass.update(1, Some((1, 1, 10, 50)));
+        pass.update(2, Some((1, 1, 10, 50)));
+        pass.update(3, Some((1, 1, 20, 80)));
+        assert_eq!(pass.spans(), [(1, 10, 80)]);
+        assert_eq!(pass.slot_count(), 3);
+        pass.update(3, Some((2, 2, 90, 100)));
+        pass.update(1, None);
+        let mut spans = pass.spans();
+        spans.sort();
+        assert_eq!(spans, [(1, 10, 50), (2, 90, 100)]);
+        assert_eq!(pass.slot_count(), 2);
+        pass.update(2, Some((1, 1, 16, 32)));
+        pass.update(3, None);
+        pass.update(2, Some((1, 1, 16, 32)));
+        assert_eq!(pass.spans(), [(1, 16, 32)]);
+        assert_eq!(pass.slot_count(), 1);
+        pass.update(2, None);
+        assert!(pass.spans().is_empty());
+        assert_eq!(pass.slot_count(), 0);
+    }
 
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
@@ -1170,16 +1281,24 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, ranges, pass, unwatched } = &mut *kept;
+    let incremental = incremental_buffer_pass();
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
+        if incremental {
+            pass.clear();
+        }
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
+        if incremental {
+            ranges.forget_part_with(part, parts, |slot| pass.update(slot, None));
+        } else {
+            ranges.forget_part(part, parts);
+        }
         let mut slots = host.buffer_slots_of(part, parts);
         slots.extend(changed);
         slots
@@ -1249,6 +1368,9 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             }
             range
         });
+        if incremental {
+            pass.update(index, range.as_ref().map(|(s, from, to)| (s.id(), s.clone(), *from, *to)));
+        }
         ranges.set(index, range);
     }
     if crate::picked::on() {
@@ -1257,16 +1379,24 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
-    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+    let (span_list, views, bytes): (Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>, u32, u64) = if incremental {
+        let list = pass.spans();
+        let bytes = list.iter().map(|s| s.2 - s.1).sum();
+        (list, pass.slot_count() as u32, bytes)
+    } else {
+        let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
+        let mut views = 0u32;
+        for (shadow, from, to) in ranges.ranges() {
+            views += 1;
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+            span.1 = span.1.min(*from);
+            span.2 = span.2.max(*to);
+        }
+        let list: Vec<_> = spans.into_values().collect();
+        let bytes = list.iter().map(|s| s.2 - s.1).sum();
+        (list, views, bytes)
+    };
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
@@ -1278,9 +1408,9 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(spans.len());
+    let mut found = Vec::with_capacity(span_list.len());
     let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
+    for (shadow, from, to) in &span_list {
         if every > 1 && shadow.unwatched() {
             let id = shadow.id();
             if let Some(&(last, low, high)) = unwatched.get(&id)
@@ -1294,6 +1424,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
     *unwatched = next_unwatched;
+    let copies = span_list.len();
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
@@ -1310,7 +1441,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies,
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"

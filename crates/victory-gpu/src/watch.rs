@@ -319,6 +319,21 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// Whether `with_writes` reuses a thread-local answer buffer and `Batch::flush_all`
+/// skips building `ask_ahead` ranges while a submission-wide asking stands
+/// (`VICTORY_REFRESH_SCRATCH=0` disables it; ported from `stellarr-studio/kelvaroq`
+/// `0053-submit.patch`, commit `f3c070cc`, GPL-3.0-or-later).
+pub(crate) fn refresh_scratch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_SCRATCH").is_none_or(|v| v != "0"))
+}
+
+/// A submission-wide asking already covers its flushes. Avoid building
+/// and sorting another list of ranges just to discard it under the lock.
+pub(crate) fn kept_asking() -> bool {
+    refresh_scratch() && journal().kept
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -326,6 +341,14 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if ranges.len() < 2 {
+        return;
+    }
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`. Check before allocating and sorting `pieces`.
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -337,11 +360,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
@@ -666,12 +684,60 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
+fn fill_written(j: &Journal, first: usize, last: usize, out: &mut Vec<(usize, u64)>) {
+    out.clear();
+    out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+}
+
+fn ahead_into(j: &Journal, first: usize, last: usize, out: &mut Vec<(usize, u64)>) -> Option<u64> {
+    j.ahead
+        .iter()
+        .any(|&(a, b)| a <= first && last <= b)
+        .then(|| {
+            fill_written(j, first, last, out);
+            j.ahead_asked
+        })
+}
+
+/// Like [`writes`] with `guarded = true`, reusing a thread-local scratch buffer
+/// when [`refresh_scratch`] is enabled (ported from `stellarr-studio/kelvaroq`
+/// `0053-submit.patch`, commit `f3c070cc`, GPL-3.0-or-later).
+pub(crate) fn with_writes<T>(
+    start: usize,
+    end: usize,
+    use_pages: impl FnOnce(u64, &[(usize, u64)]) -> T,
+) -> Option<T> {
+    if refresh_scratch() {
+        thread_local! {
+            static PAGES: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        PAGES.with(|storage| {
+            if let Ok(mut pages) = storage.try_borrow_mut() {
+                let stamp = writes_into(start, end, true, &mut pages)?;
+                Some(use_pages(stamp, &pages))
+            } else {
+                let (stamp, pages) = writes(start, end, true)?;
+                Some(use_pages(stamp, &pages))
+            }
+        })
+    } else {
+        let (stamp, pages) = writes(start, end, true)?;
+        Some(use_pages(stamp, &pages))
+    }
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut pages = Vec::new();
+    let now = writes_into(start, end, guarded, &mut pages)?;
+    Some((now, pages))
+}
+
+fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec<(usize, u64)>) -> Option<u64> {
     // Guarding asks Windows about the pages and protects them: a lazy view
     // is none to it yet. (Not so a view in the books alone, which is
     // guarded there: [`use_soft_views`].)
@@ -679,10 +745,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         materialize(start, end.saturating_sub(start));
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead_into(&journal(), first, last, out) {
         return Some(known);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
@@ -693,12 +757,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        fill_written(&j, first, last, out);
+        return Some(next_asking());
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead_into(&journal(), first, last, out) {
         return Some(known);
     }
     let mut guards_asked = false;
@@ -731,15 +796,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        fill_written(&j, first, last, out);
+        return Some(next_asking());
     }
-    let answer = {
+    let now = {
         let mut j = journal_mut();
         let now = next_asking();
         for &(page, parts) in &pages {
             j.note(page, parts, now);
         }
-        (now, of(&j))
+        fill_written(&j, first, last, out);
+        now
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came
@@ -747,7 +814,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if guards_asked && light() {
         publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
     }
-    Some(answer)
+    Some(now)
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes

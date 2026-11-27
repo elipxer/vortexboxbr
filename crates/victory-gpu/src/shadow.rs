@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -320,8 +320,28 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+struct CardEntry {
+    start: usize,
+    end: usize,
+    seq: u64,
+    weak: std::sync::Weak<Shadow>,
+}
+
+/// Address-indexed registry of copies in the card's memory: 64 KiB title-block
+/// buckets for O(overlap) `send_copied` lookup instead of scanning all copies.
+#[derive(Default)]
+struct CardIndex {
+    entries: std::collections::HashMap<u64, CardEntry>,
+    buckets: BTreeMap<usize, Vec<u64>>,
+    order: u64,
+}
+
+/// The copies in the card's memory, indexed by 64 KiB title block.
+static CARDED: std::sync::OnceLock<RwLock<CardIndex>> = std::sync::OnceLock::new();
+
+fn carded_index() -> &'static RwLock<CardIndex> {
+    CARDED.get_or_init(|| RwLock::new(CardIndex::default()))
+}
 
 /// The copies in the card's memory whose `touched` was set since
 /// [`card_dirty`] last took them (a copy may be on it twice). Before, each
@@ -330,19 +350,52 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
 /// `shadow`, just made with a card side, is noted among the copies in the
-/// card's memory; the copies let go are dropped from the list once it has
-/// doubled since that was last done.
+/// card's memory; unregistered on [`Drop`].
 fn carded(shadow: &Arc<Shadow>) {
-    static KEPT: AtomicUsize = AtomicUsize::new(0);
     let Some(card) = &shadow.card else {
         return;
     };
-    let _ = card.me.set(Arc::downgrade(shadow));
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-    carded.push(Arc::downgrade(shadow));
-    if carded.len() >= 2 * KEPT.load(Ordering::Relaxed).max(1024) {
-        carded.retain(|weak| weak.strong_count() > 0);
-        KEPT.store(carded.len(), Ordering::Relaxed);
+    let weak = Arc::downgrade(shadow);
+    let _ = card.me.set(weak.clone());
+    let start = shadow.start as usize;
+    let end = start.saturating_add(shadow.len as usize);
+    let mut idx = carded_index().write().unwrap_or_else(|e| e.into_inner());
+    let seq = idx.order;
+    idx.order = idx.order.wrapping_add(1);
+    idx.entries.insert(shadow.id, CardEntry { start, end, seq, weak: weak.clone() });
+    if start < end {
+        let first = start / PAGE;
+        let last = (end - 1) / PAGE;
+        for block in first..=last {
+            idx.buckets.entry(block).or_default().push(shadow.id);
+        }
+    }
+    drop(idx);
+    if card.touched.load(Ordering::Acquire) {
+        TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    }
+}
+
+fn unregister_carded(id: u64, start: usize, end: usize) {
+    let Some(lock) = CARDED.get() else {
+        return;
+    };
+    let mut idx = lock.write().unwrap_or_else(|e| e.into_inner());
+    if idx.entries.remove(&id).is_none() || start >= end {
+        return;
+    }
+    let first = start / PAGE;
+    let last = (end - 1) / PAGE;
+    for block in first..=last {
+        let empty = if let Some(ids) = idx.buckets.get_mut(&block) {
+            ids.retain(|&other| other != id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            idx.buckets.remove(&block);
+        }
     }
 }
 
@@ -364,7 +417,13 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = carded_index()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .values()
+        .filter(|e| e.weak.strong_count() > 0)
+        .count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -781,9 +840,44 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    let Some(dst_end) = dst.checked_add(len) else {
+        return;
+    };
+    if len == 0 {
+        return;
+    }
+    let matched: Vec<Arc<Shadow>> = {
+        let idx = carded_index().read().unwrap_or_else(|e| e.into_inner());
+        if idx.buckets.is_empty() {
+            return;
+        }
+        let first = dst / PAGE;
+        let last = (dst_end - 1) / PAGE;
+        let mut ids: Vec<u64> = Vec::new();
+        for (_, bucket) in idx.buckets.range(first..=last) {
+            ids.extend_from_slice(bucket);
+        }
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let mut found: Vec<(u64, Arc<Shadow>)> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(entry) = idx.entries.get(&id)
+                && dst < entry.end
+                && dst_end > entry.start
+                && let Some(shadow) = entry.weak.upgrade()
+            {
+                found.push((entry.seq, shadow));
+            }
+        }
+        found.sort_unstable_by_key(|(seq, _)| *seq);
+        found.into_iter().map(|(_, s)| s).collect()
+    };
+    for shadow in matched {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
-        let (from, to) = (dst.max(start), (dst + len).min(end));
+        let (from, to) = (dst.max(start), dst_end.min(end));
         if from >= to {
             continue;
         }
@@ -797,7 +891,13 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    carded_index()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .values()
+        .filter_map(|e| e.weak.upgrade())
+        .collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -2699,6 +2799,7 @@ impl Drop for Shadow {
             CARD_BYTES[0].fetch_sub(self.width(), Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
+            unregister_carded(self.id, self.start as usize, (self.start as usize).saturating_add(self.len as usize));
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
@@ -3994,11 +4095,11 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some(copied) = crate::watch::with_writes(from, to, |now, written| {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4006,6 +4107,8 @@ impl Shadow {
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
+                copied
+            }) {
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);

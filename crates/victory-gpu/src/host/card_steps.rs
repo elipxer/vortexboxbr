@@ -411,15 +411,22 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
     Ok(shadow)
 }
 
-/// What the steps of `runs` do, and which step each is (its list by address,
-/// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+/// What the steps of `runs` do, which step each is (its list by address,
+/// its place in it), and for `Step::Fill` its destination (avoiding per-fill
+/// list searches and mutex relocks). `written`: what flights may write.
+fn does_of(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Option<FillTo>>) {
     let mut does = Vec::new();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
+    let mut fills = Vec::new();
     for list in runs {
-        for (i, step) in list.deferred().copies.iter().enumerate() {
+        let deferred = list.deferred();
+        for (i, step) in deferred.copies.iter().enumerate() {
+            let mut fill = None;
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
                     dst,
@@ -427,12 +434,15 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     len,
                     asked: copy_blocked(written, dst, src, len).is_some(),
                 },
-                Step::Fill(_, src, len, to) => Does::Fill {
-                    src: *src,
-                    len: *len,
-                    asked: read_blocked(written, *src, *len),
-                    to: to.is_some(),
-                },
+                Step::Fill(_, src, len, to) => {
+                    fill = to.clone();
+                    Does::Fill {
+                        src: *src,
+                        len: *len,
+                        asked: read_blocked(written, *src, *len),
+                        to: to.is_some(),
+                    }
+                }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     Does::Read {
@@ -457,9 +467,10 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+            fills.push(fill);
         }
     }
-    (does, steps)
+    (does, steps, fills)
 }
 
 /// With flights in the air: before which of `runs` the submission is cut so
@@ -477,7 +488,7 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (does, steps, _) = does_of(&written, runs);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -507,16 +518,6 @@ fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
 
 /// A table by addresses and numbers of ours.
 type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<AddressHash>>;
-
-/// Where the bytes of the fill that is `step` (its list by address, its place
-/// in it) go.
-fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
-    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
-    match list.deferred().copies.get(step.1)? {
-        Step::Fill(_, _, _, to) => to.clone(),
-        _ => None,
-    }
-}
 
 /// A step done on the card.
 struct Op {
@@ -688,7 +689,7 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
+        let (does, steps, mut fills) = does_of(written, runs);
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
@@ -766,7 +767,7 @@ impl Host {
                     held.clear();
                     To::Copy(to, dst)
                 }
-                _ => match fill_to(runs, steps[i]) {
+                _ => match fills[i].take() {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
@@ -834,19 +835,18 @@ impl Host {
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
         spent.next("steps on the card: the slots");
-        // (11,000 slots a frame in a street, two descriptors each: on
-        // several threads, a slot always on the same one, in the steps'
-        // order.)
+        // (11,000 slots a frame in a street, two descriptors each: pre-bucket
+        // by part so each worker touches only its own slots and acquires
+        // `SHADER_HEAPS` once instead of once per slot.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
-                }
+        let mut buckets: Vec<Vec<(usize, u32, u64, u32)>> = (0..parts).map(|_| Vec::new()).collect();
+        for op in &ops {
+            if let To::Slot(heap, index) = &op.to {
+                buckets[*index as usize / 4 % parts].push((*heap, *index, gpu + op.at, op.len as u32));
             }
+        }
+        crate::land::each_under(parts, &|part| {
+            crate::descriptor::constant_slots_batch(&buckets[part], &own.between);
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);

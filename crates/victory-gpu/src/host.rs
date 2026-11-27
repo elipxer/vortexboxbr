@@ -6280,43 +6280,145 @@ impl Host {
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
+    /// Uses a thread-local scratch CPU heap (64 slots) so concurrent thin
+    /// command-list workers never wrap or overwrite each other's handles.
     pub(crate) fn rtv(
         &self,
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        use windows::core::Interface;
+        struct LocalRtv {
+            device_key: usize,
+            _heap: ID3D12DescriptorHeap,
+            start: usize,
+            step: usize,
+            next: u32,
+        }
+        const LOCAL_RTV: u32 = 64;
+        thread_local! {
+            static LOCAL: std::cell::RefCell<Option<LocalRtv>> = const { std::cell::RefCell::new(None) };
+        }
         if let (Some(r), Some(d)) = (resource, desc) {
             // SAFETY: a live resource.
             let own = unsafe { r.GetDesc() }.Format.0 as u32;
             crate::resource::note_cast("render target", own, d.Format.0 as u32);
         }
+        let dev_key = self.device.as_raw() as usize;
+        let handle = LOCAL.with(|cell| {
+            let mut slot_heap = cell.borrow_mut();
+            let rebuild = slot_heap.as_ref().is_none_or(|h| h.device_key != dev_key);
+            if rebuild {
+                // SAFETY: non-shader-visible CPU descriptor heap for this device.
+                let heap: Option<ID3D12DescriptorHeap> = unsafe {
+                    self.device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                            NumDescriptors: LOCAL_RTV,
+                            ..Default::default()
+                        })
+                        .ok()
+                };
+                *slot_heap = heap.map(|heap| {
+                    // SAFETY: live heap just created above.
+                    let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
+                    LocalRtv {
+                        device_key: dev_key,
+                        _heap: heap,
+                        start,
+                        step: self.rtv_size as usize,
+                        next: 0,
+                    }
+                });
+            }
+            slot_heap.as_mut().map(|h| {
+                let idx = h.next % LOCAL_RTV;
+                h.next = h.next.wrapping_add(1);
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.start + idx as usize * h.step }
+            })
+        });
+        let handle = handle.unwrap_or_else(|| {
+            let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+            // SAFETY: fallback to shared host RTV ring.
+            let mut h = unsafe { self.rtvs.GetCPUDescriptorHandleForHeapStart() };
+            h.ptr += (slot * self.rtv_size) as usize;
+            h
+        });
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 
     /// A host depth view of `resource`, valid until it is recorded.
+    /// Uses a thread-local scratch CPU heap (16 slots) so concurrent thin
+    /// command-list workers never wrap or overwrite each other's handles.
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        use windows::core::Interface;
+        struct LocalDsv {
+            device_key: usize,
+            _heap: ID3D12DescriptorHeap,
+            start: usize,
+            step: usize,
+            next: u32,
+        }
+        const LOCAL_DSV: u32 = 16;
+        thread_local! {
+            static LOCAL: std::cell::RefCell<Option<LocalDsv>> = const { std::cell::RefCell::new(None) };
+        }
+        let dev_key = self.device.as_raw() as usize;
+        let handle = LOCAL.with(|cell| {
+            let mut slot_heap = cell.borrow_mut();
+            let rebuild = slot_heap.as_ref().is_none_or(|h| h.device_key != dev_key);
+            if rebuild {
+                // SAFETY: non-shader-visible CPU descriptor heap for this device.
+                let heap: Option<ID3D12DescriptorHeap> = unsafe {
+                    self.device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                            NumDescriptors: LOCAL_DSV,
+                            ..Default::default()
+                        })
+                        .ok()
+                };
+                *slot_heap = heap.map(|heap| {
+                    // SAFETY: live heap just created above.
+                    let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
+                    LocalDsv {
+                        device_key: dev_key,
+                        _heap: heap,
+                        start,
+                        step: self.dsv_size as usize,
+                        next: 0,
+                    }
+                });
+            }
+            slot_heap.as_mut().map(|h| {
+                let idx = h.next % LOCAL_DSV;
+                h.next = h.next.wrapping_add(1);
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.start + idx as usize * h.step }
+            })
+        });
+        let handle = handle.unwrap_or_else(|| {
+            let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+            // SAFETY: fallback to shared host DSV ring.
+            let mut h = unsafe { self.dsvs.GetCPUDescriptorHandleForHeapStart() };
+            h.ptr += (slot * self.dsv_size) as usize;
+            h
+        });
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 
     /// 1-descriptor shader-visible CBV/SRV/UAV fallback heap for directly-indexed root signatures.
@@ -8568,7 +8670,7 @@ impl Batch {
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::kept_asking();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
@@ -8714,7 +8816,7 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1 && !crate::watch::kept_asking();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
