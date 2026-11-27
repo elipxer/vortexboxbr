@@ -9,6 +9,7 @@ param(
     [switch]$SmoothMotion,
     [switch]$RayTracing,
     [switch]$LegacySubmit,
+    [int]$MaxTexDim = 1024,
     [string]$LogFile,
     [switch]$NoLog,
     [ValidateSet('diag', 'release')][string]$Build = 'release',
@@ -30,21 +31,24 @@ $tuned = @{
     # Restore guest streaming-thread priorities (0 left them at IDLE/LOWEST causing 1+ second load lag under load).
     VICTORY_TITLE_PRIORITIES = '1'
     # 8 GB VRAM + PCIe 3.0 x8 tuning (7.1 GB WDDM budget):
-    # - Allocate texture mip levels on demand (now fixed in resource.rs:2494 so pool no longer hijacks reserved textures!).
-    # - Keep texture room at 85% (~6.0 GB) so render targets + driver + DWM stay strictly below 7.1 GB (zero PCIe paging).
-    # - Keep hot small buffers (>= 64 KiB, cap 768 MiB) in VRAM with 1800 MiB reserved for Series S render targets.
+    # - Allocate texture mip levels on demand (saved 2.8 GB VRAM in live Wave 1 log!).
+    # - Cap sampled 2D texture resolution (default 1024px) to drop 2K/4K top mips (~1.5-2.2 GB extra VRAM + staging saved).
+    # - Keep CARD_BUFFERS at >= 1 MiB (cap 1280 MiB) so tiny 64 KiB buffers no longer lock out >= 1 MiB shader-written
+    #   buffers (eliminates ~75 MB/frame CPU snapshots + ~11 ms/frame CPU compare + PCIe shader stalls!).
+    # - Move hottest 512 MiB of read-only vertex/index/constant windows into GDDR6 VRAM (breaks 6% GDDR6 / 52W PCIe stall!).
     VICTORY_LEVELS_ON_DEMAND = '1'
-    VICTORY_CARD_BUFFERS_MIN_KB = '64'
-    VICTORY_CARD_BUFFERS_MB = '768'
+    VICTORY_MAX_TEXTURE_DIM = $MaxTexDim.ToString([Globalization.CultureInfo]::InvariantCulture)
+    VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    VICTORY_CARD_BUFFERS_MB = '1280'
+    VICTORY_CARD_WINDOWS_MB = '512'
     VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1800'
-    VICTORY_TEXTURE_ROOM_PERCENT = '85'
+    VICTORY_TEXTURE_ROOM_PERCENT = '88'
     # Xeon E5-2650 v3 (10c/20t Haswell, 25 MB L3) right-sized worker pools:
-    # - Avoid 75-thread oversubscription and spin-wait CPU burn across 10 physical cores.
     VICTORY_DSTORAGE_THREADS = '6'
-    VICTORY_LAND_THREADS = '3'
+    VICTORY_LAND_THREADS = '5'
     VICTORY_UNDER_THREADS = '4'
-    VICTORY_VIEW_THREADS = '3'
-    VICTORY_WIDE_THREADS = '4'
+    VICTORY_VIEW_THREADS = '4'
+    VICTORY_WIDE_THREADS = '5'
     VICTORY_WIDE_SPIN = '0'
     VICTORY_LAND_SKIP = '1'
     VICTORY_PIPELINE_WORKERS = '3'
@@ -88,8 +92,8 @@ if ($Panel) { $pass.Panel = $true }
 if ($RayTracing) { $pass.RayTracing = $true }
 
 Write-Host "=== VortexBox RTX 3050 8GB + Xeon E5-2650 v3 (10c/20t) Profile ($Build) ==="
-Write-Host "VRAM: Levels-On-Demand ON (fixed!) | Card Buffers >=64KB (cap 768MB) | Targets Room 1800MB | Texture Room 85%"
-Write-Host "CPU : Async Submit ON | Thin=$([bool]$Thin) | Wide/Under=4t Land/View=3t DStorage=6t | Spin=0 | TitlePrio=1 | Watchdog=OFF"
+Write-Host "VRAM: Levels-On-Demand ON | MaxTexDim=${MaxTexDim}px | CardBuf >=1MB (1280MB) | CardWin 512MB | TexRoom 88%"
+Write-Host "CPU : Async Submit ON | Thin=$([bool]$Thin) | Wide/Land=5t Under/View=4t DStorage=6t | Spin=0 | TitlePrio=1"
 Write-Host "OPT : Kelvaroq 0053+0055=$(if ($LegacySubmit) { 'OFF (-LegacySubmit)' } else { 'ON (Scratch/BatchGuards/SplitCopy/BatchUploads/BufferSpans)' })"
 if ($LogFile) { Write-Host "LOG : $LogFile" }
 & "$PSScriptRoot\play-nvidia.ps1" @pass

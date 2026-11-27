@@ -4483,7 +4483,63 @@ impl Copied<'_> {
 /// between `last` and `records` (of one length) go into `out` and `last`.
 /// Most of a changed page is as it was: it is looked at sixteen records at a
 /// time.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_records_32_avx2(last: &mut [u8], records: &[u8], first: u32, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let count = last.len().min(records.len()) / 32;
+    let mut i = 0usize;
+    let lp = last.as_mut_ptr();
+    let rp = records.as_ptr();
+    // SAFETY: `count * 32 <= last.len().min(records.len())`, so every unaligned
+    // 32-byte load/store at `off < count * 32` lies within both slices, and AVX2
+    // is required by `#[target_feature(enable = "avx2")]`.
+    unsafe {
+        // Fast-skip 16 x 32-byte (512-byte) blocks with branchless AVX2 XOR+OR.
+        while i + 16 <= count {
+            let mut acc = _mm256_setzero_si256();
+            let base = i * 32;
+            for k in 0..16 {
+                let off = base + k * 32;
+                let a = _mm256_loadu_si256(lp.add(off).cast());
+                let b = _mm256_loadu_si256(rp.add(off).cast());
+                acc = _mm256_or_si256(acc, _mm256_xor_si256(a, b));
+            }
+            if _mm256_testz_si256(acc, acc) == 0 {
+                for k in 0..16 {
+                    let off = base + k * 32;
+                    let a = _mm256_loadu_si256(lp.add(off).cast());
+                    let b = _mm256_loadu_si256(rp.add(off).cast());
+                    let diff = _mm256_xor_si256(a, b);
+                    if _mm256_testz_si256(diff, diff) == 0 {
+                        _mm256_storeu_si256(lp.add(off).cast(), b);
+                        out.push(first + (i + k) as u32);
+                    }
+                }
+            }
+            i += 16;
+        }
+        while i < count {
+            let off = i * 32;
+            let a = _mm256_loadu_si256(lp.add(off).cast());
+            let b = _mm256_loadu_si256(rp.add(off).cast());
+            let diff = _mm256_xor_si256(a, b);
+            if _mm256_testz_si256(diff, diff) == 0 {
+                _mm256_storeu_si256(lp.add(off).cast(), b);
+                out.push(first + i as u32);
+            }
+            i += 1;
+        }
+    }
+}
+
 fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    #[cfg(target_arch = "x86_64")]
+    if step == 32 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: `avx2` runtime-checked above; slices bounded to `min(len)/32 * 32`.
+        unsafe { changed_records_32_avx2(last, records, first, out) };
+        return;
+    }
     const AT_A_TIME: usize = 16;
     let block = AT_A_TIME * step;
     for (b, (old, new)) in last.chunks_mut(block).zip(records.chunks(block)).enumerate() {

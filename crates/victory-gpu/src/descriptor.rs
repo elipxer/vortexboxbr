@@ -359,24 +359,30 @@ pub(crate) fn sync_heaps() {
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
-            let mut page_bytes: Vec<u8> = Vec::new();
+            // Reuse one scratch page buffer per worker without re-zeroing
+            // 64 KiB before every `read_into` overwrite.
+            let mut page_bytes: Vec<u8> = vec![0; crate::watch::PAGE];
             let mut changed: Vec<u32> = Vec::new();
             for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let len = to - from;
+                if page_bytes.len() < len {
+                    page_bytes.resize(len, 0);
+                }
+                let page_slice = &mut page_bytes[..len];
+                if !crate::host::read_into(from as *const u8, page_slice) {
                     continue;
                 }
                 out.pages += 1;
                 out.views += u64::from(crate::watch::guarded(from, to));
-                out.bytes += (to - from) as u64;
+                out.bytes += len as u64;
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 // A record that straddles the range's ends is left
                 // to the range that holds its first byte.
                 let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
-                let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
+                let Some(records) = page_slice.get((start + first * step) as usize - from..) else {
                     continue;
                 };
                 let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));

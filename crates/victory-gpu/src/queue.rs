@@ -928,7 +928,6 @@ extern "system" fn present(
     note_planes(planes, plane_parameters);
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
-        const COPY_SOURCE: u32 = 0x800;
         let texture = if planes > 0
             // SAFETY: the title passes `planes` plane descriptions.
             && let Some(plane) = unsafe { plane_parameters.as_ref() }
@@ -937,23 +936,16 @@ extern "system" fn present(
         {
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
-            // The state the lists recorded so far leave it in (the next
-            // frame's, recorded before this is shown, go on from there).
-            crate::resource::host_copy(resource).map(|copy| {
-                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-                crate::resource::host_transition(resource, state);
-                // (Lists not translated yet leave it in no state yet: the
-                // one it is in when its turn in the line comes.)
-                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
-                (resource as usize, copy, state)
-            })
+            // Resolve the plane's state on the submission thread in exact queue
+            // order (`u32::MAX`) instead of swapping its shared atomic state
+            // from the title thread while preludes may be updating it.
+            crate::resource::host_copy(resource).map(|copy| (resource as usize, copy, u32::MAX))
         } else {
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
         // LOCAL (port of fxceless #1189): the interface plane, as the first.
-        let over = second_plane(planes, plane_parameters, resource as This)
-            .map(|(copy, state)| (copy, if crate::list::thin::wanted() { u32::MAX } else { state }));
+        let over = second_plane_copy(planes, plane_parameters, resource as This).map(|copy| (copy, u32::MAX));
         behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource, over });
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1017,9 +1009,8 @@ struct Shown {
 /// A Series S title presents two planes: the game and the interface
 /// (menus, loading screens, the intro), 72-byte descriptions each.
 #[cfg(windows)]
-fn second_plane(planes: u32, plane_parameters: *const Plane, first: This) -> Option<(std::sync::Arc<crate::resource::HostTexture>, u32)> {
+fn second_plane_copy(planes: u32, plane_parameters: *const Plane, first: This) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
     const STRIDE: usize = 72;
-    const COPY_SOURCE: u32 = 0x800;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_COMPOSE").is_some_and(|v| v == "1");
@@ -1041,7 +1032,16 @@ fn second_plane(planes: u32, plane_parameters: *const Plane, first: This) -> Opt
     if resource == first {
         return None;
     }
-    let copy = crate::resource::host_copy(resource)?;
+    crate::resource::host_copy(resource)
+}
+
+#[cfg(windows)]
+fn second_plane(planes: u32, plane_parameters: *const Plane, first: This) -> Option<(std::sync::Arc<crate::resource::HostTexture>, u32)> {
+    const STRIDE: usize = 72;
+    const COPY_SOURCE: u32 = 0x800;
+    let copy = second_plane_copy(planes, plane_parameters, first)?;
+    // SAFETY: `second_plane_copy` verified `planes >= 2` and non-null `plane_parameters`/`resources`.
+    let resource = unsafe { *plane_parameters.cast::<u8>().add(STRIDE).cast::<Plane>().as_ref()?.resources };
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     Some((copy, state))

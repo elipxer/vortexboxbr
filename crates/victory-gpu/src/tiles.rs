@@ -257,6 +257,8 @@ pub(crate) struct Tiled {
     packed: u32,
     /// Levels in all.
     levels: u32,
+    /// Lowest mip level allowed to receive tiles for host uploads (0: all levels).
+    min_level: u32,
     /// The bytes all its tiles would take.
     pub(crate) full: u64,
     given: Mutex<Given>,
@@ -279,6 +281,17 @@ impl Tiled {
     /// say, or cuts it in a way this does not handle; the caller then makes
     /// the texture the old way.
     pub(crate) fn make(device: &ID3D12Device, texture: &ID3D12Resource, levels: u32) -> Option<Tiled> {
+        Self::make_from(device, texture, levels, 0)
+    }
+
+    /// Like [`Tiled::make`], capping tile allocations for host uploads at
+    /// `min_level` (levels `< min_level` never receive upload tiles).
+    pub(crate) fn make_from(
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        levels: u32,
+        min_level: u32,
+    ) -> Option<Tiled> {
         if levels == 0 || levels > 16 {
             return None;
         }
@@ -332,12 +345,27 @@ impl Tiled {
             standard,
             packed: packed_tiles,
             levels,
+            min_level: min_level.min(levels.saturating_sub(1)),
             full,
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
         })
+    }
+
+    /// Lowest mip level allowed to receive tiles for host uploads.
+    pub(crate) fn min_level(&self) -> u32 {
+        self.min_level
+    }
+
+    /// Bitmask of mip levels allowed to receive tiles for host uploads.
+    fn allowed_levels(&self) -> u32 {
+        if self.min_level >= 32 {
+            0
+        } else {
+            self.every_level() & !((1u32 << self.min_level) - 1)
+        }
     }
 
     /// At the submission of a list that uploads every level of `texture`
@@ -371,7 +399,7 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
-        let held = held & self.every_level();
+        let held = held & self.allowed_levels();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
@@ -1559,6 +1587,7 @@ void look() {
             standard: vec![HEAP_TILES + 1, 1],
             packed: 0,
             levels: 2,
+            min_level: 0,
             full: TILE,
             given: Mutex::new(Given {
                 levels: vec![false, false],
@@ -1583,5 +1612,37 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn min_level_caps_tile_allocations_and_first_shown() {
+        let Some(host) = host() else {
+            return;
+        };
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: plain reserved texture creation on the host device.
+        let created = unsafe {
+            host.device
+                .CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut tex)
+        };
+        if created.is_err() {
+            return;
+        }
+        let tex = tex.unwrap();
+        let Some(tiled) = Tiled::make_from(&host.device, &tex, u32::from(LEVELS), 2) else {
+            return;
+        };
+        assert_eq!(tiled.min_level(), 2);
+        // Even if the title holds every level (0..LEVELS), levels 0 and 1 must
+        // never be mapped, first_shown starts at level 2, and nothing waits.
+        let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, from_level(0), true);
+        assert!(changed);
+        assert!(!waiting);
+        assert!(!tiled.has_tiles(0));
+        assert!(!tiled.has_tiles(1));
+        assert!(tiled.has_tiles(2));
+        assert_eq!(tiled.first_shown(), Some(2));
+        assert!(tiled.given_bytes() < tiled.full);
     }
 }
